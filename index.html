@@ -18,24 +18,59 @@ console.warn = (...a) => { if(String(a[0]).includes('Babel')) return; _cw(...a);
 <script type="text/babel" data-presets="react">
 const {useState,useEffect,useRef,useCallback}=React;
 
-// ── Google Apps Script backend ──
 const GAS_URL="https://script.google.com/macros/s/AKfycbyWWiJlQFQsT_7PY4njK5vkpzG0YT_pHqN1_mIAQ8-o3vTLREMmErDgGb4zg0kouxpJ/exec";
+
+// ── Safe-save guard: ป้องกัน overwrite ด้วยข้อมูลน้อยกว่าเดิมผิดปกติ ──
+let _lastKnown={};
+const isSafeToSave=(key,newVal)=>{
+  if(!Array.isArray(newVal))return true;
+  const prev=_lastKnown[key];
+  if(!prev||!Array.isArray(prev))return true;
+  if(prev.length>5&&newVal.length<prev.length*0.5){
+    console.warn(`[SafeSave] Blocked: ${key} จะลดจาก ${prev.length} → ${newVal.length} records`);
+    return false;
+  }
+  return true;
+};
 
 const db={
   get:async(key)=>{
     try{
       const r=await fetch(`${GAS_URL}?key=${encodeURIComponent(key)}`);
       const j=await r.json();
-      return j.ok?j.value:null;
+      const val=j.ok?j.value:null;
+      // ถ้าได้ค่ามา → จำไว้เป็น last known
+      if(val!==null&&val!==undefined){
+        if(!Array.isArray(val)||val.length>0) _lastKnown[key]=val;
+      }
+      return val;
     }catch(e){console.error("db.get error:",e);return null;}
   },
   set:async(key,value)=>{
+    if(!isSafeToSave(key,value)){
+      console.warn(`[SafeSave] Aborted save for ${key}`);
+      return;
+    }
     try{
-      await fetch(GAS_URL,{
-        method:"POST",
-        body:JSON.stringify({key,value}),
-      });
+      await fetch(GAS_URL,{method:"POST",body:JSON.stringify({key,value})});
+      _lastKnown[key]=value; // update last known หลัง save สำเร็จ
     }catch(e){console.error("db.set error:",e);}
+  },
+  // ดึง backup list จาก Google Sheet
+  getBackupList:async()=>{
+    try{
+      const r=await fetch(`${GAS_URL}?key=__backup_list__`);
+      const j=await r.json();
+      return j.ok?j.value:[];
+    }catch(e){console.error("db.getBackupList error:",e);return[];}
+  },
+  // restore จาก backup index (0 = ล่าสุด)
+  restoreBackup:async(dataKey,rowIndex=0)=>{
+    try{
+      const r=await fetch(`${GAS_URL}?key=__restore__${dataKey}__${rowIndex}`);
+      const j=await r.json();
+      return j.ok?j.value:null;
+    }catch(e){console.error("db.restoreBackup error:",e);return null;}
   }
 };
 
@@ -85,11 +120,7 @@ function Toast({msg,type="info"}){
 }
 function SyncBar({status}){
   if(!status)return null;
-  const cfg={
-    syncing:["#fffbeb","#a16207","⟳ กำลัง sync..."],
-    ok:["#dcfce7","#166534","✓ Sync สำเร็จ"],
-    error:["#fef2f2","#dc2626","✗ Sync ล้มเหลว"]
-  };
+  const cfg={syncing:["#fffbeb","#a16207","⟳ กำลัง sync..."],ok:["#dcfce7","#166534","✓ Sync สำเร็จ"],error:["#fef2f2","#dc2626","✗ Sync ล้มเหลว"]};
   const[bg,fg,msg]=cfg[status]||cfg.ok;
   return <div style={{position:"fixed",bottom:16,right:16,zIndex:999,background:bg,color:fg,padding:"6px 14px",borderRadius:20,fontSize:12,fontWeight:600,boxShadow:"0 2px 10px rgba(0,0,0,.15)",border:`1px solid ${fg}33`}}>{msg}</div>;
 }
@@ -178,18 +209,14 @@ function App(){
       setLoadMsg("โหลด master data...");
       const k=await db.get("akra_master_klang");
       const w=await db.get("akra_master_wicha");
-
       const initU=u||INIT_USERS;
       const initLG=lg||[];
       const initK=k||INIT_KLANG;
       const initW=w||INIT_WICHA;
-
-      // Save defaults if first time
       if(!u){await db.set("akra_users",initU);}
       if(!lg){await db.set("akra_logs",initLG);}
       if(!k){await db.set("akra_master_klang",initK);}
       if(!w){await db.set("akra_master_wicha",initW);}
-
       setU(initU);setLG(initLG);setMK(initK);setMW(initW);
       setL(true);
     }catch(e){
@@ -204,13 +231,16 @@ function App(){
   const saveMK=useCallback(async v=>{setMK(v);showSync("syncing");try{await db.set("akra_master_klang",v);showSync("ok");}catch{showSync("error");}}, []);
   const saveMW=useCallback(async v=>{setMW(v);showSync("syncing");try{await db.set("akra_master_wicha",v);showSync("ok");}catch{showSync("error");}}, []);
 
-  // Auto-refresh every 30s
   useEffect(()=>{
     if(!loaded||initError)return;
     const iv=setInterval(async()=>{
       try{
         const[u,lg,k,w]=await Promise.all([db.get("akra_users"),db.get("akra_logs"),db.get("akra_master_klang"),db.get("akra_master_wicha")]);
-        if(u)setU(u);if(lg)setLG(lg);if(k)setMK(k);if(w)setMW(w);
+        // safe guard: อัปเดตเฉพาะถ้าข้อมูลที่ได้กลับมาไม่ว่างผิดปกติ
+        if(u&&u.length>0)setU(u);
+        if(lg&&lg.length>0)setLG(lg);
+        if(k&&k.length>0)setMK(k);
+        if(w&&w.length>0)setMW(w);
       }catch(e){console.warn("Auto-refresh failed:",e);}
     },30000);
     return()=>clearInterval(iv);
@@ -413,22 +443,92 @@ function BulkTab({logs,saveLG,mk,mw,notify}){
 
 function AdminTab({cu,users,saveU,mk,saveMK,mw,saveMW,logs,saveLG,notify}){
   const[sub,setSub]=useState("users");const[showAdd,setAdd]=useState(false);const[editU,setEU]=useState(null);const[delU,setDU]=useState(null);
+  // ── NEW: track which user cards have password visible ──
+  const[showPwIds,setShowPwIds]=useState(new Set());
+  const togglePw=id=>setShowPwIds(prev=>{const n=new Set(prev);n.has(id)?n.delete(id):n.add(id);return n;});
+
   const fRef=useRef();
   const doExp=()=>{try{const b=new Blob([JSON.stringify({users,masterKlang:mk,masterWicha:mw,logs},null,2)],{type:"application/json;charset=utf-8"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download=`akra-backup-${tday()}.json`;document.body.appendChild(a);a.click();document.body.removeChild(a);notify("Export สำเร็จ","ok");}catch{notify("Export ล้มเหลว","error");}};
   const doImp=file=>{if(!file)return;const r=new FileReader();r.onload=e=>{try{const d=JSON.parse(e.target.result);if(d.users)saveU(d.users);if(d.masterKlang)saveMK(d.masterKlang);if(d.masterWicha)saveMW(d.masterWicha);if(d.logs)saveLG(d.logs);notify("Import JSON สำเร็จ","ok");}catch{notify("ไฟล์ไม่ถูกต้อง","error");}};r.readAsText(file);};
   const rc={admin:["#fef9c3","#a16207"],supervisor:["#dbeafe","#1d4ed8"],user:["#f1f5f9","#475569"]};
-  const tabs=[{k:"users",l:"ผู้ใช้"},{k:"klang",l:"พิธีกลาง"},{k:"wicha",l:"สายวิชา"},{k:"json",l:"Import/Export JSON"}];
+  const tabs=[{k:"users",l:"ผู้ใช้"},{k:"klang",l:"พิธีกลาง"},{k:"wicha",l:"สายวิชา"},{k:"json",l:"Import/Export JSON"},{k:"backup",l:"☁️ Backup History"}];
+
   function MList({which}){const list=which==="klang"?mk:mw;const save=which==="klang"?saveMK:saveMW;const[nv,setNv]=useState("");const[ei,setEi]=useState(null);const[ev,setEv]=useState("");const add=()=>{const v=nv.trim();if(!v)return;if(list.includes(v)){notify("มีรายการนี้อยู่แล้ว");return;}save([...list,v]);setNv("");notify("เพิ่มสำเร็จ","ok");};const rm=i=>save(list.filter((_,j)=>j!==i));const ce=()=>{const v=ev.trim();if(!v)return;if(list.includes(v)&&list[ei]!==v){notify("มีชื่อนี้อยู่แล้ว");return;}save(list.map((x,i)=>i===ei?v:x));setEi(null);setEv("");notify("แก้ไขสำเร็จ","ok");};return <div style={{maxWidth:480}}><div style={{display:"flex",gap:8,marginBottom:14}}><Inp value={nv} onChange={e=>setNv(e.target.value)} placeholder="ระบุชื่อรายการใหม่" onKeyDown={e=>e.key==="Enter"&&add()} style={{flex:1}}/><Btn c="pri" onClick={add}>+ เพิ่ม</Btn></div>{list.length===0?<p style={{color:"#94a3b8",textAlign:"center",padding:16}}>ยังไม่มีข้อมูล</p>:list.map((item,i)=><div key={i} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 10px",borderRadius:8,background:"#f8fafc",marginBottom:6,border:`1.5px solid ${ei===i?"#2563eb":"transparent"}`}}>{ei===i?<><Inp value={ev} onChange={e=>setEv(e.target.value)} autoFocus onKeyDown={e=>{if(e.key==="Enter")ce();if(e.key==="Escape"){setEi(null);setEv("");}}} style={{flex:1,padding:"5px 10px",fontSize:13}}/><Btn sm c="pri" onClick={ce}>บันทึก</Btn><Btn sm onClick={()=>{setEi(null);setEv("");}}>ยกเลิก</Btn></>:<><span style={{flex:1,fontSize:13}}>{item}</span><Btn sm onClick={()=>{setEi(i);setEv(item);}}>แก้ไข</Btn><Btn sm c="dan" onClick={()=>rm(i)}>ลบ</Btn></>}</div>)}</div>;}
+
   function UModal({u,onClose}){const isE=!!u;const[n,setN]=useState(u?.displayName||"");const[un,setUn]=useState(u?.username||"");const[pw,setPw]=useState("");const[rl,setRl]=useState(u?.role||"user");const[st,setSt]=useState(u?.status||"active");const save=()=>{if(!isE){if(!un||!pw){notify("กรุณากรอก Username และ Password","error");return;}if(users.find(x=>x.username===un)){notify("Username นี้มีในระบบแล้ว","error");return;}saveU([...users,{id:uid(),username:un,password:pw,displayName:n||un,role:rl,status:st}]);}else{saveU(users.map(x=>x.id===u.id?{...x,displayName:n||x.displayName,role:rl,status:st,...(pw?{password:pw}:{})}:x));}notify("บันทึกสำเร็จ","ok");onClose();};return <ModalWrap title={isE?"แก้ไขผู้ใช้":"เพิ่มผู้ใช้ใหม่"} onClose={onClose}><FG label="ชื่อที่แสดง"><Inp value={n} onChange={e=>setN(e.target.value)}/></FG><FG label="Username *"><Inp value={un} onChange={e=>setUn(e.target.value)} disabled={isE}/></FG><FG label={isE?"Password (เว้นว่างถ้าไม่เปลี่ยน)":"Password *"}><Inp type="password" value={pw} onChange={e=>setPw(e.target.value)}/></FG><div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}><FG label="Role"><Sel value={rl} onChange={e=>setRl(e.target.value)}><option value="user">User</option><option value="supervisor">Supervisor</option><option value="admin">Administrative</option></Sel></FG><FG label="Status"><Sel value={st} onChange={e=>setSt(e.target.value)}><option value="active">Active</option><option value="inactive">Inactive</option></Sel></FG></div><div style={{background:"#fffbeb",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#92400e",lineHeight:1.6,marginBottom:12}}>User=บันทึก/แก้ไข log ตัวเอง | Supervisor=ดู+Download | Admin=จัดการทั้งหมด</div><div style={{display:"flex",justifyContent:"flex-end",gap:8}}><Btn onClick={onClose}>ยกเลิก</Btn><Btn c="pri" onClick={save}>{isE?"บันทึก":"+ เพิ่ม"}</Btn></div></ModalWrap>;}
+
   return <>
     {delU&&<ConfirmDlg msg={`ลบผู้ใช้ "${users.find(u=>u.id===delU)?.username}"?`} onOk={()=>{saveU(users.filter(u=>u.id!==delU));setDU(null);notify("ลบสำเร็จ","ok");}} onNo={()=>setDU(null)}/>}
     {(showAdd||editU)&&<UModal u={editU} onClose={()=>{setAdd(false);setEU(null);}}/>}
     <h2 style={{fontSize:19,fontWeight:700,marginBottom:18}}>Back Office</h2>
     <div style={{display:"flex",gap:8,marginBottom:18,flexWrap:"wrap"}}>{tabs.map(t=><button key={t.k} onClick={()=>setSub(t.k)} style={{padding:"7px 16px",borderRadius:8,border:`1.5px solid ${sub===t.k?"#2563eb":"#e2e8f0"}`,background:sub===t.k?"#eff6ff":"#fff",color:sub===t.k?"#2563eb":"#374151",fontWeight:sub===t.k?600:400,fontSize:13,cursor:"pointer"}}>{t.l}</button>)}</div>
-    {sub==="users"&&<><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}><span style={{fontSize:14,fontWeight:700}}>ผู้ใช้งาน {users.length} คน</span><Btn c="pri" onClick={()=>setAdd(true)}>+ เพิ่มผู้ใช้</Btn></div><div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(250px,1fr))",gap:12}}>{users.map(u=>{const[rbg,rcl]=rc[u.role]||rc.user;return <div key={u.id} style={{...s.card,display:"flex",alignItems:"center",gap:10,padding:14}}><div style={{width:42,height:42,borderRadius:"50%",background:"#eff6ff",color:"#2563eb",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:15,flexShrink:0}}>{(u.displayName||u.username).slice(0,2).toUpperCase()}</div><div style={{flex:1,minWidth:0}}><div style={{fontWeight:600,fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{u.displayName||u.username}</div><div style={{fontSize:11,color:"#64748b",marginBottom:4}}>{u.username}</div><div style={{display:"flex",gap:3,flexWrap:"wrap"}}><span style={{fontSize:10,fontWeight:600,padding:"2px 6px",borderRadius:20,background:rbg,color:rcl}}>{ROLES[u.role]}</span><span style={{fontSize:10,fontWeight:600,padding:"2px 6px",borderRadius:20,background:u.status==="active"?"#dcfce7":"#fef2f2",color:u.status==="active"?"#166534":"#dc2626"}}>{u.status==="active"?"Active":"Inactive"}</span></div></div><div style={{display:"flex",flexDirection:"column",gap:4}}><Btn sm onClick={()=>setEU(u)}>แก้ไข</Btn>{u.username!=="admin"&&<Btn sm c="dan" onClick={()=>setDU(u.id)}>ลบ</Btn>}</div></div>;})}</div></>}
+
+    {sub==="users"&&<>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+        <span style={{fontSize:14,fontWeight:700}}>ผู้ใช้งาน {users.length} คน</span>
+        <Btn c="pri" onClick={()=>setAdd(true)}>+ เพิ่มผู้ใช้</Btn>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(270px,1fr))",gap:12}}>
+        {users.map(u=>{
+          const[rbg,rcl]=rc[u.role]||rc.user;
+          const pwVisible=showPwIds.has(u.id);
+          return(
+            <div key={u.id} style={{...s.card,padding:14}}>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                {/* Avatar */}
+                <div style={{width:42,height:42,borderRadius:"50%",background:"#eff6ff",color:"#2563eb",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:15,flexShrink:0}}>
+                  {(u.displayName||u.username).slice(0,2).toUpperCase()}
+                </div>
+                {/* Info */}
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:600,fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{u.displayName||u.username}</div>
+                  <div style={{fontSize:11,color:"#64748b",marginBottom:4}}>{u.username}</div>
+                  <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
+                    <span style={{fontSize:10,fontWeight:600,padding:"2px 6px",borderRadius:20,background:rbg,color:rcl}}>{ROLES[u.role]}</span>
+                    <span style={{fontSize:10,fontWeight:600,padding:"2px 6px",borderRadius:20,background:u.status==="active"?"#dcfce7":"#fef2f2",color:u.status==="active"?"#166534":"#dc2626"}}>{u.status==="active"?"Active":"Inactive"}</span>
+                  </div>
+                </div>
+                {/* Action buttons */}
+                <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                  <Btn sm onClick={()=>setEU(u)}>แก้ไข</Btn>
+                  {u.username!=="admin"&&<Btn sm c="dan" onClick={()=>setDU(u.id)}>ลบ</Btn>}
+                </div>
+              </div>
+
+              {/* ── Password row (admin only) ── */}
+              <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid #f1f5f9",display:"flex",alignItems:"center",gap:8}}>
+                <span style={{fontSize:11,color:"#94a3b8",minWidth:60}}>Password:</span>
+                <span style={{
+                  flex:1,fontSize:12,fontFamily:"monospace",
+                  background:pwVisible?"#f8fafc":"#f1f5f9",
+                  border:"1px solid #e2e8f0",
+                  borderRadius:6,padding:"3px 8px",
+                  color:pwVisible?"#0f172a":"transparent",
+                  textShadow:pwVisible?"none":"0 0 8px rgba(0,0,0,0.5)",
+                  userSelect:pwVisible?"text":"none",
+                  letterSpacing:pwVisible?"normal":"2px",
+                  transition:"all 0.2s"
+                }}>
+                  {pwVisible ? u.password : "••••••••"}
+                </span>
+                <button
+                  onClick={()=>togglePw(u.id)}
+                  title={pwVisible?"ซ่อน Password":"แสดง Password"}
+                  style={{background:"none",border:"1px solid #e2e8f0",borderRadius:6,padding:"3px 7px",cursor:"pointer",fontSize:14,color:"#64748b",lineHeight:1,flexShrink:0}}
+                >
+                  {pwVisible?"🙈":"👁"}
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </>}
+
     {sub==="klang"&&<><h3 style={{fontSize:14,fontWeight:700,marginBottom:12}}>พิธีกรรมหลัก</h3><MList which="klang"/></>}
     {sub==="wicha"&&<><h3 style={{fontSize:14,fontWeight:700,marginBottom:12}}>พิธีกรรมสายวิชา</h3><MList which="wicha"/></>}
     {sub==="json"&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,maxWidth:600}}><div style={s.card}><h3 style={{fontSize:14,fontWeight:700,marginBottom:6}}>Export JSON</h3><p style={{fontSize:13,color:"#64748b",marginBottom:14}}>Backup ข้อมูลทั้งหมด</p><Btn c="pri" onClick={doExp}>⬇ Download JSON</Btn></div><div style={s.card}><h3 style={{fontSize:14,fontWeight:700,marginBottom:6}}>Import JSON</h3><p style={{fontSize:13,color:"#64748b",marginBottom:14}}>Restore จากไฟล์ backup</p><label style={{border:"1.5px dashed #cbd5e1",borderRadius:9,padding:14,textAlign:"center",cursor:"pointer",display:"block"}}><div style={{fontSize:13,fontWeight:600}}>เลือกไฟล์ .json</div><input ref={fRef} type="file" accept=".json" style={{display:"none"}} onChange={e=>{doImp(e.target.files[0]);if(fRef.current)fRef.current.value="";}} /></label></div></div>}
+    {sub==="backup"&&<BackupTab users={users} logs={logs} mk={mk} mw={mw} saveU={saveU} saveLG={saveLG} saveMK={saveMK} saveMW={saveMW} notify={notify}/>}
   </>;
 }
 
@@ -445,6 +545,135 @@ function ProfileTab({cu,setCu,users,saveU,notify,back}){
       <FG label="Password ใหม่"><Inp type="password" value={np} onChange={e=>setNp(e.target.value)} placeholder="ระบุ password ใหม่"/></FG>
       <FG label="ยืนยัน Password ใหม่"><Inp type="password" value={cp} onChange={e=>setCp(e.target.value)} placeholder="ยืนยัน password ใหม่"/></FG>
       <div style={{display:"flex",justifyContent:"flex-end",gap:8,marginTop:4}}><Btn onClick={back}>ยกเลิก</Btn><Btn c="pri" onClick={save}>บันทึก</Btn></div>
+    </div>
+  </div>;
+}
+
+// ── BackupTab: ดู Backup History จาก Google Sheet และ Restore ──
+function BackupTab({users,logs,mk,mw,saveU,saveLG,saveMK,saveMW,notify}){
+  const[backupList,setBL]=useState(null);
+  const[loading,setLoading]=useState(false);
+  const[restoring,setRestoring]=useState(null);
+
+  const KEYS=[
+    {key:"akra_users",label:"ผู้ใช้งาน",save:saveU,current:users},
+    {key:"akra_logs",label:"บันทึก Log",save:saveLG,current:logs},
+    {key:"akra_master_klang",label:"พิธีกลาง",save:saveMK,current:mk},
+    {key:"akra_master_wicha",label:"สายวิชา",save:saveMW,current:mw},
+  ];
+
+  const loadList=async()=>{
+    setLoading(true);
+    const list=await db.getBackupList();
+    setBL(list);
+    setLoading(false);
+  };
+
+  useEffect(()=>{loadList();},[]);
+
+  const fmtTs=ts=>{
+    try{return new Date(ts).toLocaleString("th-TH",{dateStyle:"short",timeStyle:"short"});}
+    catch{return ts;}
+  };
+
+  const handleRestore=async(dataKey,label,rowIndex)=>{
+    if(!window.confirm(`Restore "${label}" จาก backup นี้?\n\nข้อมูลปัจจุบันจะถูกแทนที่ด้วย backup`))return;
+    setRestoring(dataKey+"_"+rowIndex);
+    const data=await db.restoreBackup(dataKey,rowIndex);
+    if(!data){notify("ไม่สามารถ restore ได้ กรุณาลองใหม่","error");setRestoring(null);return;}
+    const found=KEYS.find(k=>k.key===dataKey);
+    if(found){
+      await found.save(data);
+      notify(`✅ Restore "${label}" สำเร็จ (${Array.isArray(data)?data.length:"N/A"} รายการ)`,"ok");
+    }
+    setRestoring(null);
+    await loadList();
+  };
+
+  // จัดกลุ่ม backup list ตาม key
+  const grouped={};
+  (backupList||[]).forEach(r=>{
+    if(!grouped[r.key])grouped[r.key]=[];
+    grouped[r.key].push(r);
+  });
+  // reverse แต่ละ key ให้ล่าสุดมาก่อน
+  Object.keys(grouped).forEach(k=>{grouped[k].reverse();});
+
+  const th={background:"#f8fafc",padding:"8px 12px",textAlign:"left",fontWeight:700,fontSize:11,color:"#64748b",borderBottom:"1px solid #e2e8f0"};
+  const td={padding:"8px 12px",borderBottom:"1px solid #f1f5f9",fontSize:12,verticalAlign:"middle"};
+
+  return <div style={{maxWidth:800}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+      <div>
+        <h3 style={{fontSize:15,fontWeight:700}}>☁️ Backup History</h3>
+        <p style={{fontSize:12,color:"#64748b",marginTop:3}}>ข้อมูลถูก backup อัตโนมัติทุกครั้งที่มีการบันทึก เก็บไว้ใน Google Sheet ส่วนกลาง</p>
+      </div>
+      <Btn sm onClick={loadList} disabled={loading}>{loading?"กำลังโหลด...":"🔄 Refresh"}</Btn>
+    </div>
+
+    {/* สถานะปัจจุบัน */}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:10,marginBottom:18}}>
+      {KEYS.map(({key,label,current})=>(
+        <div key={key} style={{...s.card,padding:"12px 14px"}}>
+          <div style={{fontSize:11,color:"#64748b",marginBottom:2}}>{label}</div>
+          <div style={{fontSize:20,fontWeight:800,color:BL}}>{Array.isArray(current)?current.length:"-"}</div>
+          <div style={{fontSize:10,color:"#94a3b8"}}>รายการปัจจุบัน</div>
+        </div>
+      ))}
+    </div>
+
+    {loading&&<div style={{textAlign:"center",padding:32,color:"#94a3b8"}}>กำลังโหลด backup list จาก Google Sheet...</div>}
+
+    {!loading&&backupList!==null&&backupList.length===0&&(
+      <div style={{...s.card,textAlign:"center",padding:32,color:"#94a3b8"}}>
+        <div style={{fontSize:32,marginBottom:8}}>📭</div>
+        <div>ยังไม่มี backup ใน Google Sheet</div>
+        <div style={{fontSize:12,marginTop:4}}>Backup จะถูกสร้างอัตโนมัติหลังจากมีการบันทึกข้อมูลครั้งต่อไปค่ะ</div>
+      </div>
+    )}
+
+    {/* Backup list แยกตาม key */}
+    {!loading&&Object.keys(grouped).map(key=>{
+      const info=KEYS.find(k=>k.key===key);
+      const rows=grouped[key];
+      return(
+        <div key={key} style={{...s.card,padding:0,marginBottom:14,overflow:"hidden"}}>
+          <div style={{background:"#f8fafc",padding:"10px 16px",borderBottom:"1px solid #e2e8f0",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span style={{fontWeight:700,fontSize:13}}>{info?.label||key}</span>
+            <span style={{fontSize:11,color:"#94a3b8"}}>{rows.length} snapshots</span>
+          </div>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse"}}>
+              <thead><tr>
+                <th style={th}>#</th>
+                <th style={th}>เวลา backup</th>
+                <th style={th}>จำนวน</th>
+                <th style={th}>จัดการ</th>
+              </tr></thead>
+              <tbody>
+                {rows.slice(0,10).map((r,i)=>(
+                  <tr key={i} style={{background:i===0?"#f0fdf4":"#fff"}}>
+                    <td style={{...td,color:"#94a3b8"}}>{i===0?<span style={{color:"#16a34a",fontWeight:600}}>ล่าสุด</span>:`-${i}`}</td>
+                    <td style={td}>{fmtTs(r.timestamp)}</td>
+                    <td style={td}><span style={{fontWeight:600,color:BL}}>{r.record_count}</span> รายการ</td>
+                    <td style={td}>
+                      <Btn sm c="grn"
+                        disabled={restoring===key+"_"+i}
+                        onClick={()=>handleRestore(key,info?.label||key,i)}>
+                        {restoring===key+"_"+i?"กำลัง restore...":"↩ Restore"}
+                      </Btn>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      );
+    })}
+
+    <div style={{padding:"10px 14px",background:"#fffbeb",border:"1px solid #fde047",borderRadius:10,fontSize:12,color:"#92400e",marginTop:4}}>
+      💡 ระบบเก็บ backup ไว้ <b>30 snapshots ล่าสุดต่อ key</b> — กด Restore เพื่อกู้คืนข้อมูลจาก snapshot ที่ต้องการค่ะ
     </div>
   </div>;
 }
