@@ -49,10 +49,9 @@ const fmtD=s=>{if(!s)return"-";const[y,m,d]=s.split("-");return`${d}/${m}/${y}`;
 const isAdmin=cu=>cu?.role==="admin";
 const isSup=cu=>cu?.role==="admin"||cu?.role==="supervisor";
 const canEdit=(log,cu)=>{
-  if(!cu)return false;if(isAdmin(cu))return true;
-  if(log.username!==cu.username)return false;
-  const dd=new Date(new Date(log.date).getFullYear(),new Date(log.date).getMonth()+1,4,23,59,59);
-  return new Date()<=dd;
+  if(!cu)return false;
+  if(isAdmin(cu))return true;
+  return log.username===cu.username;
 };
 const dlCSV=(headers,rows,name)=>{
   const body=[headers,...rows].map(r=>r.map(c=>`"${String(c??"").replace(/"/g,'""')}"`).join(",")).join("\n");
