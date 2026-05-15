@@ -522,9 +522,35 @@ function BackupTab({users,logs,mk,mw,saveU,saveLG,saveMK,saveMW,notify}){
   const grouped={};
   (backupList||[]).forEach(r=>{if(!grouped[r.key])grouped[r.key]=[];grouped[r.key].push(r);});
   Object.keys(grouped).forEach(k=>{grouped[k].reverse();});
+  const[expandedRow,setExpandedRow]=useState(null);
   const th={background:"#f8fafc",padding:"8px 12px",textAlign:"left",fontWeight:700,fontSize:11,color:"#64748b",borderBottom:"1px solid #e2e8f0"};
   const td={padding:"8px 12px",borderBottom:"1px solid #f1f5f9",fontSize:12,verticalAlign:"middle"};
-  return <div style={{maxWidth:800}}>
+
+  // แสดง badge สี changes
+  const renderChanges=changes=>{
+    if(!changes||changes==="ไม่มีการเปลี่ยนแปลง")return<span style={{fontSize:11,color:"#94a3b8"}}>—</span>;
+    return<span style={{fontSize:11,fontWeight:600,color:"#0f766e",background:"#f0fdf4",border:"1px solid #86efac",borderRadius:6,padding:"2px 8px"}}>{changes}</span>;
+  };
+
+  // แสดง changed_ids แยกตามประเภท +/-/~
+  const renderChangedIds=changed_ids=>{
+    if(!changed_ids)return null;
+    const items=changed_ids.split(",").map(s=>s.trim()).filter(Boolean);
+    if(items.length===0)return null;
+    return<div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:6}}>
+      {items.map((id,i)=>{
+        const type=id[0];
+        const val=id.slice(1);
+        const colors={"+":["#dcfce7","#166534"],"~":["#fef9c3","#92400e"],"-":["#fef2f2","#dc2626"]}[type]||["#f1f5f9","#475569"];
+        const label={"+":"เพิ่ม","~":"แก้ไข","-":"ลบ"}[type]||"";
+        return<span key={i} style={{fontSize:10,padding:"1px 6px",borderRadius:4,background:colors[0],color:colors[1],fontWeight:600}}>
+          {label}: {val.length>12?val.slice(0,12)+"…":val}
+        </span>;
+      })}
+    </div>;
+  };
+
+  return <div style={{maxWidth:900}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
       <div><h3 style={{fontSize:15,fontWeight:700}}>☁️ Backup History</h3><p style={{fontSize:12,color:"#64748b",marginTop:3}}>ข้อมูลถูก backup อัตโนมัติทุกครั้งที่มีการบันทึก เก็บไว้ใน Google Sheet ส่วนกลาง</p></div>
       <Btn sm onClick={loadList} disabled={loading}>{loading?"กำลังโหลด...":"🔄 Refresh"}</Btn>
@@ -557,15 +583,38 @@ function BackupTab({users,logs,mk,mw,saveU,saveLG,saveMK,saveMW,notify}){
           </div>
           <div style={{overflowX:"auto"}}>
             <table style={{width:"100%",borderCollapse:"collapse"}}>
-              <thead><tr><th style={th}>#</th><th style={th}>เวลา backup</th><th style={th}>จำนวน</th><th style={th}>จัดการ</th></tr></thead>
-              <tbody>{rows.slice(0,10).map((r,i)=>(
-                <tr key={i} style={{background:i===0?"#f0fdf4":"#fff"}}>
-                  <td style={{...td,color:"#94a3b8"}}>{i===0?<span style={{color:"#16a34a",fontWeight:600}}>ล่าสุด</span>:`-${i}`}</td>
-                  <td style={td}>{fmtTs(r.timestamp)}</td>
-                  <td style={td}><span style={{fontWeight:600,color:BL}}>{r.record_count}</span> รายการ</td>
-                  <td style={td}><Btn sm c="grn" disabled={restoring===key+"_"+i} onClick={()=>handleRestore(key,info?.label||key,i)}>{restoring===key+"_"+i?"กำลัง restore...":"↩ Restore"}</Btn></td>
-                </tr>
-              ))}</tbody>
+              <thead><tr>
+                <th style={th}>#</th>
+                <th style={th}>เวลา backup</th>
+                <th style={th}>จำนวน</th>
+                <th style={th}>การเปลี่ยนแปลง</th>
+                <th style={th}>จัดการ</th>
+              </tr></thead>
+              <tbody>{rows.slice(0,10).map((r,i)=>{
+                const rowKey=key+"_"+i;
+                const isExpanded=expandedRow===rowKey;
+                const hasDetail=r.changed_ids&&r.changed_ids.trim().length>0;
+                return<React.Fragment key={i}>
+                  <tr style={{background:i===0?"#f0fdf4":"#fff"}}>
+                    <td style={{...td,color:"#94a3b8"}}>{i===0?<span style={{color:"#16a34a",fontWeight:600}}>ล่าสุด</span>:`-${i}`}</td>
+                    <td style={td}>{fmtTs(r.timestamp)}</td>
+                    <td style={td}><span style={{fontWeight:600,color:BL}}>{r.record_count}</span> รายการ</td>
+                    <td style={td}>
+                      <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                        {renderChanges(r.changes)}
+                        {hasDetail&&<button onClick={()=>setExpandedRow(isExpanded?null:rowKey)} style={{background:"none",border:"1px solid #e2e8f0",borderRadius:6,padding:"1px 7px",fontSize:11,cursor:"pointer",color:"#64748b"}}>{isExpanded?"▲ ซ่อน":"▼ ดูรายละเอียด"}</button>}
+                      </div>
+                    </td>
+                    <td style={td}><Btn sm c="grn" disabled={restoring===rowKey} onClick={()=>handleRestore(key,info?.label||key,i)}>{restoring===rowKey?"กำลัง restore...":"↩ Restore"}</Btn></td>
+                  </tr>
+                  {isExpanded&&hasDetail&&<tr style={{background:"#f8fafc"}}>
+                    <td colSpan={5} style={{padding:"10px 16px",borderBottom:"1px solid #f1f5f9"}}>
+                      <div style={{fontSize:11,fontWeight:600,color:"#475569",marginBottom:6}}>Records ที่เปลี่ยนแปลง:</div>
+                      {renderChangedIds(r.changed_ids)}
+                    </td>
+                  </tr>}
+                </React.Fragment>;
+              })}</tbody>
             </table>
           </div>
         </div>
