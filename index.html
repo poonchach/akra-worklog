@@ -520,8 +520,8 @@ function BackupTab({users,logs,mk,mw,saveU,saveLG,saveMK,saveMW,notify}){
     setRestoring(null);await loadList();
   };
   const grouped={};
+  // GAS ส่งมาเรียง desc (ใหม่ก่อน) แล้ว — ไม่ต้อง reverse อีก
   (backupList||[]).forEach(r=>{if(!grouped[r.key])grouped[r.key]=[];grouped[r.key].push(r);});
-  Object.keys(grouped).forEach(k=>{grouped[k].reverse();});
   const[expandedRow,setExpandedRow]=useState(null);
   const th={background:"#f8fafc",padding:"8px 12px",textAlign:"left",fontWeight:700,fontSize:11,color:"#64748b",borderBottom:"1px solid #e2e8f0"};
   const td={padding:"8px 12px",borderBottom:"1px solid #f1f5f9",fontSize:12,verticalAlign:"middle"};
