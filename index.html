@@ -18,6 +18,18 @@ console.warn = (...a) => { if(String(a[0]).includes('Babel')) return; _cw(...a);
 <script type="text/babel" data-presets="react">
 const {useState,useEffect,useRef,useCallback}=React;
 
+// 🆕 v3.9 — helper จัดการเดือน
+const ymOf=d=>/^\d{4}-\d{2}/.test(String(d||""))?String(d).slice(0,7):"unknown";
+const shiftYM=(ym,n)=>{
+  const[y,m]=ym.split("-").map(Number);
+  const dt=new Date(y,m-1+n,1);
+  return `${dt.getFullYear()}-${("0"+(dt.getMonth()+1)).slice(-2)}`;
+};
+const defaultMonths=()=>{const cur=ymOf(new Date().toISOString().slice(0,10));
+  return[shiftYM(cur,-1),cur,shiftYM(cur,1)];};
+const thMonth=ym=>{const[y,m]=ym.split("-");
+  return["ม.ค.","ก.พ.","มี.ค.","เม.ย.","พ.ค.","มิ.ย.","ก.ค.","ส.ค.","ก.ย.","ต.ค.","พ.ย.","ธ.ค."][+m-1]+" "+y;};
+
 const GAS_URL="https://script.google.com/macros/s/AKfycbyWWiJlQFQsT_7PY4njK5vkpzG0YT_pHqN1_mIAQ8-o3vTLREMmErDgGb4zg0kouxpJ/exec";
 
 // ✅ SAFETY: แยก "ไม่มีข้อมูล" ออกจาก "โหลดไม่สำเร็จ"
@@ -65,6 +77,54 @@ const db={
       }
     }
   },
+  // 🆕 v3.9 — โหลดสารบัญ (เล็กมาก) และก้อนรายเดือน
+  getLogsIndex:async()=>{
+    const r=await db.get("__logs_index__");
+    return r.ok?{ok:true,value:r.value||{months:{},total:0}}:r;
+  },
+  getLogsMonths:async(months)=>{
+    if(!months||months.length===0)return {ok:true,value:[]};
+    for(let a=1;a<=3;a++){
+      try{
+        const url=`${GAS_URL}?key=__logs_months__&months=${encodeURIComponent(months.join(","))}`;
+        const r=await fetchT(url);
+        if(!r.ok)throw new Error("HTTP "+r.status);
+        const txt=await r.text();
+        if(txt.trim().startsWith("<"))throw new Error("ได้ HTML แทน JSON");
+        const j=JSON.parse(txt);
+        if(!j.ok)throw new Error(j.error||"GAS error");
+        return {ok:true,value:j.value||[]};
+      }catch(e){
+        console.warn(`getLogsMonths ครั้งที่ ${a}:`,e.message);
+        if(a===3)return {ok:false,error:e.name==="AbortError"?"หมดเวลารอ (timeout)":e.message};
+        await new Promise(s=>setTimeout(s,1000*a));
+      }
+    }
+  },
+  getLogsAll:async()=>{
+    const r=await db.get("__logs_all__");
+    return r.ok?{ok:true,value:r.value||[]}:r;
+  },
+  // 🆕 delta write — ส่งเฉพาะที่เปลี่ยน เดือนที่ไม่ได้โหลดจึงไม่หาย
+  postOp:async(body)=>{
+    for(let a=1;a<=3;a++){
+      try{
+        const r=await fetchT(GAS_URL,{method:"POST",body:JSON.stringify(body)});
+        if(!r.ok)throw new Error("HTTP "+r.status);
+        const txt=await r.text();
+        if(txt.trim().startsWith("<"))throw new Error("ได้ HTML แทน JSON");
+        const j=JSON.parse(txt);
+        if(!j.ok)throw new Error(j.error||"GAS error");
+        return {ok:true,value:j};
+      }catch(e){
+        console.warn(`postOp(${body.op}) ครั้งที่ ${a}:`,e.message);
+        if(a===3)return {ok:false,error:e.name==="AbortError"?"หมดเวลารอ (timeout)":e.message};
+        await new Promise(s=>setTimeout(s,1000*a));
+      }
+    }
+  },
+  upsertLogs:(records)=>db.postOp({op:"upsertLogs",records}),
+  deleteLogs:(ids)=>db.postOp({op:"deleteLogs",ids}),
   getBackupList:async()=>{
     try{const r=await fetch(`${GAS_URL}?key=__backup_list__`);const j=await r.json();return j.ok?j.value:[];}
     catch(e){console.error("db.getBackupList error:",e);return[];}
@@ -190,6 +250,10 @@ function App(){
   const[mk,setMK]=useState([]);
   const[mw,setMW]=useState([]);
   const[logs,setLG]=useState([]);
+  // 🆕 v3.9 — สถานะการโหลดแบบรายเดือน
+  const[logsIndex,setLogsIndex]=useState({months:{},total:0});
+  const[loadedMonths,setLoadedMonths]=useState([]);
+  const[loadingMore,setLoadingMore]=useState(false);
   const[cu,setCu]=useState(null);
   const[tab,setTab]=useState("logs");
   const[toast,setT]=useState(null);
@@ -204,8 +268,12 @@ function App(){
     try{
       setLoadMsg("โหลดข้อมูลผู้ใช้...");
       const ru=await db.get("akra_users");
-      setLoadMsg("โหลด log... (อาจใช้เวลาสักครู่)");
-      const rlg=await db.get("akra_logs");
+      setLoadMsg("โหลดสารบัญ log...");
+      const rix=await db.getLogsIndex();
+      // 🆕 โหลดแค่ เดือนก่อน + เดือนนี้ + เดือนหน้า
+      const want=defaultMonths();
+      setLoadMsg("โหลด log "+want.map(thMonth).join(", ")+"...");
+      const rlg=await db.getLogsMonths(want);
       setLoadMsg("โหลด master data...");
       const rk=await db.get("akra_master_klang");
       const rw=await db.get("akra_master_wicha");
@@ -213,6 +281,7 @@ function App(){
       // ✅ SAFETY: ถ้าโหลดล้มเหลว → หยุดทันที ห้ามเขียนอะไรทับ
       const failed=[];
       if(!ru.ok) failed.push("ผู้ใช้ ("+ru.error+")");
+      if(!rix.ok)failed.push("สารบัญ ("+rix.error+")");
       if(!rlg.ok)failed.push("log ("+rlg.error+")");
       if(!rk.ok) failed.push("พิธีกลาง ("+rk.error+")");
       if(!rw.ok) failed.push("สายวิชา ("+rw.error+")");
@@ -230,11 +299,12 @@ function App(){
 
       // เขียนค่าเริ่มต้นเฉพาะเมื่อยืนยันแล้วว่ายังไม่เคยมีข้อมูล (value===null)
       if(ru.value===null) {await db.set("akra_users",initU);}
-      if(rlg.value===null){await db.set("akra_logs",initLG);}
       if(rk.value===null) {await db.set("akra_master_klang",initK);}
       if(rw.value===null) {await db.set("akra_master_wicha",initW);}
 
       setU(initU);setLG(initLG);setMK(initK);setMW(initW);
+      setLogsIndex(rix.value||{months:{},total:0});
+      setLoadedMonths(want);
       setL(true);
     }catch(e){
       console.error(e);
@@ -267,6 +337,62 @@ function App(){
   };
 
   const saveU =useCallback(async v=>saveWithGuard("akra_users","ผู้ใช้",uRef.current,v,setU),[]);
+  const lmRef=useRef([]);
+  useEffect(()=>{lmRef.current=loadedMonths;},[loadedMonths]);
+
+  // 🆕 v3.9 — บันทึกเฉพาะที่เปลี่ยน (เดือนที่ไม่ได้โหลดจึงไม่หาย)
+  const upsertLogs=useCallback(async(records)=>{
+    if(!records||records.length===0)return true;
+    showSync("syncing");
+    const r=await db.upsertLogs(records);
+    if(!r.ok){showSync("error");
+      window.alert("บันทึกไม่สำเร็จ: "+r.error+"\nกรุณาลองใหม่");return false;}
+    // อัปเดต state ในเครื่อง
+    setLG(prev=>{
+      const m={};prev.forEach(x=>m[x.id]=x);records.forEach(x=>m[x.id]=x);
+      const ms=lmRef.current;
+      return Object.keys(m).map(k=>m[k])
+        .filter(x=>ms.length===0||ms.indexOf(ymOf(x.date))>=0)
+        .sort((a,b)=>String(b.date||"").localeCompare(String(a.date||"")));
+    });
+    if(r.value&&r.value.months)setLogsIndex({months:r.value.months,total:r.value.total});
+    showSync("ok");return true;
+  },[]);
+
+  const deleteLogs=useCallback(async(ids)=>{
+    if(!ids||ids.length===0)return true;
+    showSync("syncing");
+    const r=await db.deleteLogs(ids);
+    if(!r.ok){showSync("error");
+      window.alert("ลบไม่สำเร็จ: "+r.error+"\nกรุณาลองใหม่");return false;}
+    setLG(prev=>prev.filter(x=>ids.indexOf(x.id)<0));
+    if(r.value&&r.value.months)setLogsIndex({months:r.value.months,total:r.value.total});
+    showSync("ok");return true;
+  },[]);
+
+  // โหลดเดือนเพิ่ม
+  const loadMonths=useCallback(async(months)=>{
+    const need=months.filter(m=>lmRef.current.indexOf(m)<0);
+    if(need.length===0)return true;
+    setLoadingMore(true);
+    const r=await db.getLogsMonths(need);
+    setLoadingMore(false);
+    if(!r.ok){window.alert("โหลดข้อมูลไม่สำเร็จ: "+r.error);return false;}
+    setLG(prev=>{
+      const m={};prev.forEach(x=>m[x.id]=x);(r.value||[]).forEach(x=>m[x.id]=x);
+      return Object.keys(m).map(k=>m[k])
+        .sort((a,b)=>String(b.date||"").localeCompare(String(a.date||"")));
+    });
+    setLoadedMonths(prev=>[...prev,...need]);
+    return true;
+  },[]);
+
+  const loadAllMonths=useCallback(async()=>{
+    const all=Object.keys(logsIndex.months||{});
+    return loadMonths(all);
+  },[logsIndex]);
+
+  // ยังเก็บไว้สำหรับ Import JSON ที่แทนที่ทั้งหมด
   const saveLG=useCallback(async v=>saveWithGuard("akra_logs","log",lgRef.current,v,setLG),[]);
   const saveMK=useCallback(async v=>{setMK(v);showSync("syncing");const r=await db.set("akra_master_klang",v);showSync(r.ok?"ok":"error");},[]);
   const saveMW=useCallback(async v=>{setMW(v);showSync("syncing");const r=await db.set("akra_master_wicha",v);showSync(r.ok?"ok":"error");},[]);
@@ -275,9 +401,13 @@ function App(){
     if(!loaded||initError)return;
     const iv=setInterval(async()=>{
       try{
-        const[ru,rlg,rk,rw]=await Promise.all([db.get("akra_users"),db.get("akra_logs"),db.get("akra_master_klang"),db.get("akra_master_wicha")]);
+        const ms=lmRef.current;
+        const[ru,rix,rlg,rk,rw]=await Promise.all([
+          db.get("akra_users"),db.getLogsIndex(),db.getLogsMonths(ms),
+          db.get("akra_master_klang"),db.get("akra_master_wicha")]);
         // ✅ SAFETY: อัปเดตเฉพาะเมื่อโหลดสำเร็จและข้อมูลไม่ว่าง
         if(ru.ok &&Array.isArray(ru.value) &&ru.value.length>0)setU(ru.value);
+        if(rix.ok&&rix.value)setLogsIndex(rix.value);
         if(rlg.ok&&Array.isArray(rlg.value)&&rlg.value.length>0)setLG(prev=>rlg.value.length>=prev.length?rlg.value:prev);
         if(rk.ok &&Array.isArray(rk.value) &&rk.value.length>0)setMK(rk.value);
         if(rw.ok &&Array.isArray(rw.value) &&rw.value.length>0)setMW(rw.value);
@@ -310,7 +440,8 @@ function App(){
   if(!cu)return <LoginPage users={users} setCu={setCu} setTab={setTab} notify={notify} saveU={saveU} syncStatus={syncStatus}/>;
 
   const TABS=[{k:"entry",l:"บันทึก"},{k:"logs",l:"รายงาน Log"},{k:"bulk",l:"Bulk Upload"},...(isAdmin(cu)?[{k:"admin",l:"Back Office"}]:[])];
-  const sp={cu,users,saveU,mk,saveMK,mw,saveMW,logs,saveLG,notify};
+  const sp={cu,users,saveU,mk,saveMK,mw,saveMW,logs,saveLG,notify,
+    upsertLogs,deleteLogs,loadMonths,loadAllMonths,logsIndex,loadedMonths,loadingMore};
 
   return(
     <div style={{minHeight:"100vh",background:"#f1f5f9"}}>
@@ -339,7 +470,7 @@ function App(){
       <div style={{maxWidth:1200,margin:"0 auto",padding:20}}>
         {tab==="entry"&&<EntryTab {...sp}/>}
         {tab==="logs"&&<LogsTab {...sp}/>}
-        {tab==="bulk"&&<BulkTab logs={logs} saveLG={saveLG} mk={mk} mw={mw} notify={notify}/>}
+        {tab==="bulk"&&<BulkTab logs={logs} mk={mk} mw={mw} notify={notify} upsertLogs={upsertLogs} loadMonths={loadMonths} loadedMonths={loadedMonths} logsIndex={logsIndex} loadingMore={loadingMore}/>}
         {tab==="admin"&&<AdminTab {...sp}/>}
         {tab==="profile"&&<ProfileTab cu={cu} setCu={setCu} users={users} saveU={saveU} notify={notify} back={()=>setTab("logs")}/>}
       </div>
@@ -371,14 +502,20 @@ function LoginPage({users,setCu,setTab,notify,saveU,syncStatus}){
   );
 }
 
-function EntryTab({cu,users,mk,mw,logs,saveLG,notify}){
+function EntryTab({cu,users,mk,mw,logs,notify,upsertLogs,loadMonths,loadedMonths}){
   const[alertDlg,setAlertDlg]=useState(null);const[formKey,setFormKey]=useState(0);
-  const save=f=>{
+  const save=async f=>{
+    // 🆕 ถ้ากรอกวันที่ของเดือนที่ยังไม่ได้โหลด ต้องโหลดก่อนเพื่อตรวจซ้ำให้ถูก
+    const ym=ymOf(f.date);
+    if(loadedMonths.indexOf(ym)<0){
+      const ok=await loadMonths([ym]);
+      if(!ok)return;
+    }
     const existing=logs.find(l=>l.username===f.username&&l.date===f.date);
-    let newLogs;
-    if(existing){newLogs=logs.map(l=>l.id===existing.id?{...existing,...f}:l);}
-    else{newLogs=[{id:uid(),...f,createdAt:new Date().toISOString()},...logs];}
-    saveLG(newLogs);
+    const rec=existing?{...existing,...f}
+                      :{id:uid(),...f,createdAt:new Date().toISOString()};
+    const ok=await upsertLogs([rec]);
+    if(!ok)return;
     setAlertDlg({title:"บันทึกข้อมูลเรียบร้อย",body:<div>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:4}}>
         <div style={{background:"#f8fafc",borderRadius:8,padding:"10px 14px"}}><div style={{fontSize:11,color:"#64748b",marginBottom:2}}>ผู้ทำงาน</div><div style={{fontWeight:600,fontSize:13}}>{users.find(u=>u.username===f.username)?.displayName||f.username}</div></div>
@@ -400,7 +537,7 @@ function EntryTab({cu,users,mk,mw,logs,saveLG,notify}){
   );
 }
 
-function LogsTab({cu,users,mk,mw,logs,saveLG,notify}){
+function LogsTab({cu,users,mk,mw,logs,notify,upsertLogs,deleteLogs,loadMonths,loadAllMonths,logsIndex,loadedMonths,loadingMore}){
   const[mode,setMode]=useState("records");const[q,setQ]=useState("");const[fu,setFu]=useState("");
   const[fdFrom,setFdFrom]=useState("");const[fdTo,setFdTo]=useState("");const[fk,setFk]=useState("");const[fw,setFw]=useState("");
   const[editing,setEd]=useState(null);const[delId,setDI]=useState(null);const[alertDlg,setAlertDlg]=useState(null);
@@ -413,13 +550,41 @@ function LogsTab({cu,users,mk,mw,logs,saveLG,notify}){
   if(fk)fl=fl.filter(l=>l.phitiKlang?.some(x=>x.t===fk));
   if(fw)fl=fl.filter(l=>l.phitiWicha?.some(x=>x.t===fw));
   if(q.trim()){const lq=q.toLowerCase();fl=fl.filter(l=>(umap[l.username]||"").toLowerCase().includes(lq)||l.phitiKlang?.some(x=>x.t.toLowerCase().includes(lq))||l.phitiWicha?.some(x=>x.t.toLowerCase().includes(lq))||l.others?.some(x=>x.d.toLowerCase().includes(lq)));}
-  const doSaveEdit=f=>{saveLG(logs.map(l=>l.id===editing.id?{...l,...f}:l));setAlertDlg({title:"แก้ไขสำเร็จ",body:`อัปเดตข้อมูลวันที่ ${fmtD(f.date)} เรียบร้อยแล้ว`});setEd(null);};
-  const doDelete=id=>{saveLG(logs.filter(l=>l.id!==id));notify("ลบสำเร็จ","ok");setDI(null);};
+  const doSaveEdit=async f=>{
+    const rec={...editing,...f};
+    const ok=await upsertLogs([rec]);
+    if(!ok)return;
+    setAlertDlg({title:"แก้ไขสำเร็จ",body:`อัปเดตข้อมูลวันที่ ${fmtD(f.date)} เรียบร้อยแล้ว`});
+    setEd(null);
+  };
+  const doDelete=async id=>{
+    const ok=await deleteLogs([id]);
+    if(ok)notify("ลบสำเร็จ","ok");
+    setDI(null);
+  };
   const byU={};fl.forEach(l=>{if(!byU[l.username])byU[l.username]={km:{},wm:{},oh:0,days:new Set()};const r=byU[l.username];l.phitiKlang?.forEach(x=>{r.km[x.t]=(r.km[x.t]||0)+(parseFloat(x.q)||0);});l.phitiWicha?.forEach(x=>{r.wm[x.t]=(r.wm[x.t]||0)+(parseFloat(x.q)||0);});l.others?.forEach(x=>{r.oh+=parseFloat(x.h)||0;});r.days.add(l.date);});
   const allK=[...new Set(fl.flatMap(l=>l.phitiKlang?.map(x=>x.t)||[]))];const allW=[...new Set(fl.flatMap(l=>l.phitiWicha?.map(x=>x.t)||[]))];const sumRows=Object.entries(byU);
   const dlR=()=>dlCSV(["ชื่อ","วันที่","เข้า","ออก","พิธีกลาง","สายวิชา","งานอื่นๆ","รวมชม."],fl.map(l=>[umap[l.username]||l.username,l.date,l.timeIn||"",l.timeOut||"",l.phitiKlang?.map(x=>`${x.t}(${x.q})`).join("; ")||"",l.phitiWicha?.map(x=>`${x.t}(${x.q})`).join("; ")||"",l.others?.map(x=>x.d+(x.h?`(${x.h}ชม.)`:"")).join("; ")||"",l.others?.reduce((s,x)=>s+(parseFloat(x.h)||0),0)||0]),`log-${tday()}.csv`);
   const dlS=()=>dlCSV(["ชื่อ","วันทำงาน",...allK,...allW,"รวมชม.อื่นๆ"],sumRows.map(([un,r])=>[umap[un]||un,r.days.size,...allK.map(k=>r.km[k]||0),...allW.map(k=>r.wm[k]||0),r.oh.toFixed(1)]),`summary-${tday()}.csv`);
   const hasFilter=fu||fdFrom||fdTo||fk||fw||q.trim();
+
+  // 🆕 v3.9 — เมื่อเลือกช่วงวันที่ ให้โหลดเดือนที่ยังไม่มีอัตโนมัติ
+  useEffect(()=>{
+    if(!fdFrom&&!fdTo)return;
+    const from=fdFrom||fdTo, to=fdTo||fdFrom;
+    const a=ymOf(from), b=ymOf(to);
+    if(a==="unknown"||b==="unknown")return;
+    const need=[];let cur=a<=b?a:b;const end=a<=b?b:a;
+    for(let i=0;i<60&&cur<=end;i++){need.push(cur);cur=shiftYM(cur,1);}
+    const missing=need.filter(m=>loadedMonths.indexOf(m)<0&&(logsIndex.months||{})[m]);
+    if(missing.length>0)loadMonths(missing);
+  },[fdFrom,fdTo]);
+
+  // สรุปสถานะการโหลด
+  const allMonths=Object.keys(logsIndex.months||{}).sort();
+  const notLoaded=allMonths.filter(m=>loadedMonths.indexOf(m)<0);
+  const notLoadedCount=notLoaded.reduce((s,m)=>s+(logsIndex.months[m]||0),0);
+  const shownMonths=loadedMonths.filter(m=>(logsIndex.months||{})[m]).sort();
   const th={background:"#f8fafc",padding:"8px 12px",textAlign:"left",fontWeight:700,fontSize:11,color:"#64748b",borderBottom:"1px solid #e2e8f0",whiteSpace:"nowrap"};
   const td={padding:"8px 12px",borderBottom:"1px solid #f1f5f9",fontSize:12,verticalAlign:"middle"};
   const tog=(val,setV,opts)=><div style={{display:"flex",background:"#f1f5f9",borderRadius:8,padding:3,gap:2}}>{opts.map(([v,l])=><button key={v} onClick={()=>setV(v)} style={{padding:"4px 12px",borderRadius:6,border:"none",background:val===v?"#2563eb":"transparent",color:val===v?"#fff":"#64748b",cursor:"pointer",fontSize:12,fontWeight:500}}>{l}</button>)}</div>;
@@ -441,6 +606,19 @@ function LogsTab({cu,users,mk,mw,logs,saveLG,notify}){
         {hasFilter&&<div style={{paddingBottom:2}}><Btn sm onClick={()=>{setQ("");setFu("");setFdFrom("");setFdTo("");setFk("");setFw("");}}>ล้าง</Btn></div>}
       </div>
       {(fdFrom||fdTo)&&<div style={{marginTop:8,padding:"6px 10px",background:"#eff6ff",borderRadius:8,fontSize:12,color:"#1d4ed8",fontWeight:500}}>📅 แสดงช่วง: {fdFrom?fmtD(fdFrom):"ทั้งหมด"} — {fdTo?fmtD(fdTo):"ทั้งหมด"}</div>}
+      {/* 🆕 v3.9 — สถานะการโหลดรายเดือน */}
+      <div style={{marginTop:8,padding:"8px 12px",background:notLoadedCount>0?"#fffbeb":"#f0fdf4",
+        border:`1px solid ${notLoadedCount>0?"#fde68a":"#bbf7d0"}`,borderRadius:8,
+        display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,flexWrap:"wrap"}}>
+        <div style={{fontSize:12,color:notLoadedCount>0?"#92400e":"#166534",lineHeight:1.7}}>
+          📅 กำลังแสดง <b>{shownMonths.length>0?shownMonths.map(thMonth).join(", "):"—"}</b>
+          {" "}({logs.length} รายการ)
+          {notLoadedCount>0&&<div>ยังมีอีก <b>{notLoadedCount}</b> รายการใน {notLoaded.length} เดือน
+            {" ("+notLoaded.map(thMonth).join(", ")+")"}</div>}
+        </div>
+        {notLoadedCount>0&&<Btn sm c="pri" disabled={loadingMore} onClick={loadAllMonths}>
+          {loadingMore?"กำลังโหลด...":"⬇ โหลดทั้งหมด"}</Btn>}
+      </div>
     </div>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
       <span style={{fontSize:14,fontWeight:600}}>{mode==="records"?<>Log <b style={{color:BL}}>{fl.length}</b> รายการ</>:<>Summary <b style={{color:BL}}>{sumRows.length}</b> คน</>}</span>
@@ -451,14 +629,42 @@ function LogsTab({cu,users,mk,mw,logs,saveLG,notify}){
   </>;
 }
 
-function BulkTab({logs,saveLG,mk,mw,notify}){
+function BulkTab({logs,mk,mw,notify,upsertLogs,loadMonths,loadedMonths,logsIndex,loadingMore}){
   const[step,setStep]=useState("up");const[parsed,setP]=useState([]);const[errs,setE]=useState([]);const[dupe,setDupe]=useState("skip");
   const[confirmOpen,setConfirmOpen]=useState(false);const[resultDlg,setResultDlg]=useState(null);
   const fRef=useRef();
   const dlT=()=>{const h=["username","date","timeIn","timeOut","phitiKlang","phitiWicha","others"];const ex=[["admin","2026-03-15","09:00","17:00","สวดถวาย|2;แนะนำลูกศิษย์|1","Sound Bath|1;Consult|2","ประสาน|1.5;ดูแล|0.5"]];const note=["# พิธีกรรม: ชื่อ|จำนวน;ชื่อ2|จำนวน2","# others: งาน|ชม.;งาน2|ชม.","# date: YYYY-MM-DD",""];const kl=mk.map((k,i)=>`# พิธีกลาง ${i+1}: ${k}`);const wl=mw.map((w,i)=>`# สายวิชา ${i+1}: ${w}`);const txt=note.join("\n")+h.join(",")+"\n"+ex.map(r=>r.map(c=>`"${c}"`).join(",")).join("\n")+"\n\n"+kl.join("\n")+"\n\n"+wl.join("\n");const b=new Blob(["\uFEFF"+txt],{type:"text/csv;charset=utf-8"});const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="akra_template.csv";document.body.appendChild(a);a.click();document.body.removeChild(a);};
   const parseF=file=>{const r=new FileReader();r.onload=e=>{const txt=e.target.result.replace(/^\uFEFF/,"").split("\n").filter(l=>!l.trim().startsWith("#")).join("\n").trim();const lines=txt.split("\n").map(l=>l.trim()).filter(Boolean);if(lines.length<2){setE(["ไม่พบข้อมูล"]);setP([]);setStep("prev");return;}const hdrs=lines[0].split(",").map(h=>h.replace(/^"|"$/g,"").trim());const good=[],bad=[];lines.slice(1).forEach((ln,ri)=>{const vals=[];let c="",q=false;for(let i=0;i<ln.length;i++){if(ln[i]==='"')q=!q;else if(ln[i]===","&&!q){vals.push(c.trim());c="";}else c+=ln[i];}vals.push(c.trim());const row={};hdrs.forEach((h,i)=>{row[h]=(vals[i]||"").replace(/^"|"$/g,"").trim();});const un=row.username||"",dt=row.date||"";if(!un){bad.push(`แถว ${ri+2}: ไม่มี username`);return;}if(!dt||!/^\d{4}-\d{2}-\d{2}$/.test(dt)){bad.push(`แถว ${ri+2}: date ไม่ถูกต้อง`);return;}const pI=v=>(v||"").split(";").map(s=>{const p=s.trim().split("|");return p[0].trim()?{t:p[0].trim(),q:p[1]?.trim()||"1"}:null;}).filter(Boolean);const pO=v=>(v||"").split(";").map(s=>{const p=s.trim().split("|");return p[0].trim()?{d:p[0].trim(),h:p[1]?.trim()||""}:null;}).filter(Boolean);good.push({id:uid(),username:un,date:dt,timeIn:row.timeIn||"",timeOut:row.timeOut||"",phitiKlang:pI(row.phitiKlang),phitiWicha:pI(row.phitiWicha),others:pO(row.others),createdAt:new Date().toISOString(),_src:"csv"});});setP(good);setE(bad);setStep("prev");};r.readAsText(file,"utf-8");};
+  // 🆕 v3.9 — โหลดเดือนที่ไฟล์อ้างถึงก่อน เพื่อให้ตรวจซ้ำได้ครบ
+  const[monthsReady,setMonthsReady]=useState(true);
+  useEffect(()=>{
+    if(parsed.length===0){setMonthsReady(true);return;}
+    const need=[...new Set(parsed.map(p=>ymOf(p.date)))]
+      .filter(m=>m!=="unknown"&&loadedMonths.indexOf(m)<0&&(logsIndex.months||{})[m]);
+    if(need.length===0){setMonthsReady(true);return;}
+    setMonthsReady(false);
+    loadMonths(need).then(ok=>setMonthsReady(!!ok));
+  },[parsed]);
+
   const dupCount=parsed.filter(nl=>logs.some(e=>e.username===nl.username&&e.date===nl.date)).length;
-  const doImp=()=>{let ex=[...logs];let a=0,sk=0,rp=0;parsed.forEach(nl=>{const di=ex.findIndex(e=>e.username===nl.username&&e.date===nl.date);if(di===-1){ex.push(nl);a++;}else if(dupe==="replace"){ex[di]={...nl,id:ex[di].id};rp++;}else if(dupe==="both"){ex.push({...nl,id:uid()});a++;}else sk++;});saveLG(ex);setConfirmOpen(false);setResultDlg({added:a,replaced:rp,skipped:sk,errors:errs.length});setStep("done");};
+  const doImp=async()=>{
+    // 🆕 v3.9 — ส่งเฉพาะรายการที่เพิ่ม/แก้ ไม่ส่งทั้งก้อน
+    const toUpsert=[];let a=0,sk=0,rp=0;
+    parsed.forEach(nl=>{
+      const ex=logs.find(e=>e.username===nl.username&&e.date===nl.date);
+      if(!ex){toUpsert.push(nl);a++;}
+      else if(dupe==="replace"){toUpsert.push({...nl,id:ex.id});rp++;}
+      else if(dupe==="both"){toUpsert.push({...nl,id:uid()});a++;}
+      else sk++;
+    });
+    setConfirmOpen(false);
+    if(toUpsert.length>0){
+      const ok=await upsertLogs(toUpsert);
+      if(!ok)return;
+    }
+    setResultDlg({added:a,replaced:rp,skipped:sk,errors:errs.length});
+    setStep("done");
+  };
   const reset=()=>{setStep("up");setP([]);setE([]);setResultDlg(null);if(fRef.current)fRef.current.value="";};
   const th={background:"#f8fafc",padding:"8px 12px",textAlign:"left",fontWeight:700,fontSize:11,color:"#64748b",borderBottom:"1px solid #e2e8f0"};const td2={padding:"8px 12px",borderBottom:"1px solid #f1f5f9",fontSize:12};
   if(step==="up")return <div style={{maxWidth:640}}>
@@ -468,7 +674,7 @@ function BulkTab({logs,saveLG,mk,mw,notify}){
   </div>;
   if(step==="prev")return <div>
     {confirmOpen&&<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:400,padding:16}}><div style={{background:"#fff",borderRadius:14,width:"100%",maxWidth:400,overflow:"hidden",boxShadow:"0 20px 60px rgba(0,0,0,.25)"}}><div style={{background:"#eff6ff",padding:"16px 20px",borderBottom:"1px solid #93c5fd"}}><div style={{fontWeight:700,fontSize:16,color:"#1e40af"}}>ยืนยันการ Import</div></div><div style={{padding:"18px 20px"}}><div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>{[["นำเข้า",parsed.length,"#16a34a"],["ซ้ำ",dupCount,"#a16207"],["มีปัญหา",errs.length,"#dc2626"]].map(([lb,v,c])=><div key={lb} style={{background:"#f8fafc",borderRadius:8,padding:"10px 12px",textAlign:"center"}}><div style={{fontSize:22,fontWeight:800,color:c}}>{v}</div><div style={{fontSize:11,color:"#64748b",marginTop:2}}>{lb}</div></div>)}</div></div><div style={{padding:"0 20px 16px",display:"flex",justifyContent:"flex-end",gap:8}}><Btn onClick={()=>setConfirmOpen(false)}>ยกเลิก</Btn><Btn c="pri" onClick={doImp}>ยืนยัน</Btn></div></div></div>}
-    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:8}}><div><h2 style={{fontSize:19,fontWeight:700}}>Preview ก่อน Import</h2><p style={{fontSize:13,color:"#64748b",marginTop:3}}>พบ <b style={{color:"#16a34a"}}>{parsed.length}</b> รายการ{errs.length>0&&<> | <b style={{color:"#dc2626"}}>{errs.length}</b> มีปัญหา</>}{dupCount>0&&<> | <b style={{color:"#a16207"}}>{dupCount}</b> ซ้ำ</>}</p></div><div style={{display:"flex",gap:8}}><Btn onClick={reset}>กลับ</Btn><Btn c="pri" disabled={!parsed.length} onClick={()=>setConfirmOpen(true)}>Import ({parsed.length})</Btn></div></div>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:8}}><div><h2 style={{fontSize:19,fontWeight:700}}>Preview ก่อน Import</h2><p style={{fontSize:13,color:"#64748b",marginTop:3}}>พบ <b style={{color:"#16a34a"}}>{parsed.length}</b> รายการ{errs.length>0&&<> | <b style={{color:"#dc2626"}}>{errs.length}</b> มีปัญหา</>}{dupCount>0&&<> | <b style={{color:"#a16207"}}>{dupCount}</b> ซ้ำ</>}</p></div><div style={{display:"flex",gap:8}}><Btn onClick={reset}>กลับ</Btn><Btn c="pri" disabled={!parsed.length||!monthsReady||loadingMore} onClick={()=>setConfirmOpen(true)}>Import ({parsed.length})</Btn></div></div>
     <div style={{...s.card,marginBottom:12}}><div style={{fontSize:13,fontWeight:600,marginBottom:8}}>หากพบข้อมูลซ้ำ:</div><div style={{display:"flex",gap:8,flexWrap:"wrap"}}>{[["skip","ข้ามรายการนั้น"],["replace","แทนที่ข้อมูลเดิม"],["both","เพิ่มทั้งสอง"]].map(([k,l])=><label key={k} style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",padding:"6px 12px",borderRadius:8,border:`1.5px solid ${dupe===k?"#2563eb":"#e2e8f0"}`,background:dupe===k?"#eff6ff":"#fff",fontSize:13,fontWeight:dupe===k?600:400}}><input type="radio" name="dp" checked={dupe===k} onChange={()=>setDupe(k)}/>{l}</label>)}</div></div>
     {errs.length>0&&<div style={{background:"#fef2f2",borderRadius:10,border:"1px solid #fca5a5",padding:"10px 14px",marginBottom:12}}>{errs.map((e,i)=><div key={i} style={{fontSize:12,color:"#991b1b"}}>- {e}</div>)}</div>}
     {parsed.length>0&&<div style={{...s.card,padding:0,overflow:"auto"}}><table style={{width:"100%",borderCollapse:"collapse"}}><thead><tr>{["username","วันที่","พิธีกลาง","สายวิชา","ซ้ำ?"].map((h,i)=><th key={i} style={th}>{h}</th>)}</tr></thead><tbody>{parsed.map((l,i)=>{const isDup=logs.some(e=>e.username===l.username&&e.date===l.date);return<tr key={i} style={{background:isDup?"#fffbeb":i%2===0?"#fff":"#f8fafc"}}><td style={{...td2,fontWeight:600}}>{l.username}</td><td style={td2}>{fmtD(l.date)}</td><td style={{...td2,fontSize:11}}>{l.phitiKlang.map(x=>`${x.t}(${x.q})`).join(", ")||"-"}</td><td style={{...td2,fontSize:11}}>{l.phitiWicha.map(x=>`${x.t}(${x.q})`).join(", ")||"-"}</td><td style={{...td2,textAlign:"center"}}>{isDup?<span style={{color:"#a16207",fontWeight:600,fontSize:11}}>ซ้ำ</span>:"-"}</td></tr>;})}</tbody></table></div>}
