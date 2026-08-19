@@ -125,9 +125,42 @@ const db={
   },
   upsertLogs:(records)=>db.postOp({op:"upsertLogs",records}),
   deleteLogs:(ids)=>db.postOp({op:"deleteLogs",ids}),
+  // ⚡ v4.0 — รวมทุกอย่างที่ต้องใช้ตอนเปิดเว็บไว้ในคำขอเดียว
+  bootstrap:async(months)=>{
+    for(let a=1;a<=3;a++){
+      try{
+        const url=`${GAS_URL}?key=__bootstrap__&months=${encodeURIComponent((months||[]).join(","))}`;
+        const r=await fetchT(url);
+        if(!r.ok)throw new Error("HTTP "+r.status);
+        const txt=await r.text();
+        if(txt.trim().startsWith("<"))throw new Error("ได้ HTML แทน JSON");
+        const j=JSON.parse(txt);
+        if(!j.ok)throw new Error(j.error||"GAS error");
+        return {ok:true,value:j.value};
+      }catch(e){
+        console.warn(`bootstrap ครั้งที่ ${a}:`,e.message);
+        if(a===3)return {ok:false,error:e.name==="AbortError"?"หมดเวลารอ (timeout)":e.message};
+        await new Promise(s=>setTimeout(s,1000*a));
+      }
+    }
+  },
+  // ⚡ v4.0 — เพิ่ม retry + timeout (เดิมใช้ fetch เปล่า จึงว่างเมื่อช้า)
   getBackupList:async()=>{
-    try{const r=await fetch(`${GAS_URL}?key=__backup_list__`);const j=await r.json();return j.ok?j.value:[];}
-    catch(e){console.error("db.getBackupList error:",e);return[];}
+    for(let a=1;a<=2;a++){
+      try{
+        const r=await fetchT(`${GAS_URL}?key=__backup_list__`);
+        if(!r.ok)throw new Error("HTTP "+r.status);
+        const txt=await r.text();
+        if(txt.trim().startsWith("<"))throw new Error("ได้ HTML แทน JSON");
+        const j=JSON.parse(txt);
+        if(!j.ok)throw new Error(j.error||"GAS error");
+        return {ok:true,value:j.value||[]};
+      }catch(e){
+        console.warn(`getBackupList ครั้งที่ ${a}:`,e.message);
+        if(a===2)return {ok:false,error:e.name==="AbortError"?"หมดเวลารอ (timeout)":e.message};
+        await new Promise(s=>setTimeout(s,1200));
+      }
+    }
   },
   restoreBackup:async(dataKey,rowIndex=0)=>{
     try{const r=await fetch(`${GAS_URL}?key=__restore__${dataKey}__${rowIndex}`);const j=await r.json();return j.ok?j.value:null;}
@@ -266,44 +299,32 @@ function App(){
 
   useEffect(()=>{(async()=>{
     try{
-      setLoadMsg("โหลดข้อมูลผู้ใช้...");
-      const ru=await db.get("akra_users");
-      setLoadMsg("โหลดสารบัญ log...");
-      const rix=await db.getLogsIndex();
-      // 🆕 โหลดแค่ เดือนก่อน + เดือนนี้ + เดือนหน้า
+      // ⚡ v4.0 — รวมทุกอย่างไว้ในคำขอเดียว (เดิม 4 คำขอ)
       const want=defaultMonths();
-      setLoadMsg("โหลด log "+want.map(thMonth).join(", ")+"...");
-      const rlg=await db.getLogsMonths(want);
-      setLoadMsg("โหลด master data...");
-      const rk=await db.get("akra_master_klang");
-      const rw=await db.get("akra_master_wicha");
+      setLoadMsg("โหลดข้อมูล "+want.map(thMonth).join(", ")+"...");
+      const rb=await db.bootstrap(want);
 
       // ✅ SAFETY: ถ้าโหลดล้มเหลว → หยุดทันที ห้ามเขียนอะไรทับ
-      const failed=[];
-      if(!ru.ok) failed.push("ผู้ใช้ ("+ru.error+")");
-      if(!rix.ok)failed.push("สารบัญ ("+rix.error+")");
-      if(!rlg.ok)failed.push("log ("+rlg.error+")");
-      if(!rk.ok) failed.push("พิธีกลาง ("+rk.error+")");
-      if(!rw.ok) failed.push("สายวิชา ("+rw.error+")");
-      if(failed.length){
-        setInitError("โหลดข้อมูลไม่สำเร็จ: "+failed.join(", ")+
+      if(!rb.ok){
+        setInitError("โหลดข้อมูลไม่สำเร็จ: "+rb.error+
           " — ระบบหยุดทำงานเพื่อป้องกันข้อมูลถูกเขียนทับ กรุณา refresh หน้าใหม่");
         setL(true);
         return;
       }
 
-      const initU =ru.value  ||INIT_USERS;
-      const initLG=rlg.value ||[];
-      const initK =rk.value  ||INIT_KLANG;
-      const initW =rw.value  ||INIT_WICHA;
+      const B=rb.value||{};
+      const initU =B.users       ||INIT_USERS;
+      const initLG=B.logs        ||[];
+      const initK =B.masterKlang ||INIT_KLANG;
+      const initW =B.masterWicha ||INIT_WICHA;
 
-      // เขียนค่าเริ่มต้นเฉพาะเมื่อยืนยันแล้วว่ายังไม่เคยมีข้อมูล (value===null)
-      if(ru.value===null) {await db.set("akra_users",initU);}
-      if(rk.value===null) {await db.set("akra_master_klang",initK);}
-      if(rw.value===null) {await db.set("akra_master_wicha",initW);}
+      // เขียนค่าเริ่มต้นเฉพาะเมื่อยืนยันแล้วว่ายังไม่เคยมีข้อมูล
+      if(B.users===null)      {await db.set("akra_users",initU);}
+      if(B.masterKlang===null){await db.set("akra_master_klang",initK);}
+      if(B.masterWicha===null){await db.set("akra_master_wicha",initW);}
 
       setU(initU);setLG(initLG);setMK(initK);setMW(initW);
-      setLogsIndex(rix.value||{months:{},total:0});
+      setLogsIndex(B.logsIndex||{months:{},total:0});
       setLoadedMonths(want);
       setL(true);
     }catch(e){
@@ -687,7 +708,7 @@ function BulkTab({logs,mk,mw,notify,upsertLogs,loadMonths,loadedMonths,logsIndex
   </div>;
 }
 
-function AdminTab({cu,users,saveU,mk,saveMK,mw,saveMW,logs,saveLG,notify}){
+function AdminTab({cu,users,saveU,mk,saveMK,mw,saveMW,logs,saveLG,notify,logsIndex}){
   const[sub,setSub]=useState("users");const[showAdd,setAdd]=useState(false);const[editU,setEU]=useState(null);const[delU,setDU]=useState(null);
   // ── NEW: track which user cards have password visible ──
   const[showPwIds,setShowPwIds]=useState(new Set());
@@ -774,21 +795,30 @@ function AdminTab({cu,users,saveU,mk,saveMK,mw,saveMW,logs,saveLG,notify}){
     {sub==="klang"&&<><h3 style={{fontSize:14,fontWeight:700,marginBottom:12}}>พิธีกรรมหลัก</h3><MList which="klang"/></>}
     {sub==="wicha"&&<><h3 style={{fontSize:14,fontWeight:700,marginBottom:12}}>พิธีกรรมสายวิชา</h3><MList which="wicha"/></>}
     {sub==="json"&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,maxWidth:600}}><div style={s.card}><h3 style={{fontSize:14,fontWeight:700,marginBottom:6}}>Export JSON</h3><p style={{fontSize:13,color:"#64748b",marginBottom:14}}>Backup ข้อมูลทั้งหมด</p><Btn c="pri" onClick={doExp}>⬇ Download JSON</Btn></div><div style={s.card}><h3 style={{fontSize:14,fontWeight:700,marginBottom:6}}>Import JSON</h3><p style={{fontSize:13,color:"#64748b",marginBottom:14}}>Restore จากไฟล์ backup</p><label style={{border:"1.5px dashed #cbd5e1",borderRadius:9,padding:14,textAlign:"center",cursor:"pointer",display:"block"}}><div style={{fontSize:13,fontWeight:600}}>เลือกไฟล์ .json</div><input ref={fRef} type="file" accept=".json" style={{display:"none"}} onChange={e=>{doImp(e.target.files[0]);if(fRef.current)fRef.current.value="";}} /></label></div></div>}
-    {sub==="backup"&&<BackupTab users={users} logs={logs} mk={mk} mw={mw} saveU={saveU} saveLG={saveLG} saveMK={saveMK} saveMW={saveMW} notify={notify}/>}
+    {sub==="backup"&&<BackupTab users={users} logs={logs} mk={mk} mw={mw} saveU={saveU} saveLG={saveLG} saveMK={saveMK} saveMW={saveMW} notify={notify} logsIndex={logsIndex}/>}
   </>;
 }
 
-function BackupTab({users,logs,mk,mw,saveU,saveLG,saveMK,saveMW,notify}){
+function BackupTab({users,logs,mk,mw,saveU,saveLG,saveMK,saveMW,notify,logsIndex}){
   const[backupList,setBL]=useState(null);
   const[loading,setLoading]=useState(false);
   const[restoring,setRestoring]=useState(null);
   const KEYS=[
     {key:"akra_users",label:"ผู้ใช้งาน",save:saveU,current:users},
-    {key:"akra_logs",label:"บันทึก Log",save:saveLG,current:logs},
+    // ⚡ v4.0 — ใช้ยอดรวมจากสารบัญ ไม่ใช่จำนวนที่โหลดอยู่
+    {key:"akra_logs",label:"บันทึก Log",save:saveLG,current:logs,
+     count:(logsIndex&&logsIndex.total)||logs.length},
     {key:"akra_master_klang",label:"พิธีกลาง",save:saveMK,current:mk},
     {key:"akra_master_wicha",label:"สายวิชา",save:saveMW,current:mw},
   ];
-  const loadList=async()=>{setLoading(true);const list=await db.getBackupList();setBL(list);setLoading(false);};
+  const[listError,setListError]=useState(null);
+  const loadList=async()=>{
+    setLoading(true);setListError(null);
+    const r=await db.getBackupList();
+    if(r.ok){setBL(r.value);}
+    else{setBL([]);setListError(r.error);}
+    setLoading(false);
+  };
   useEffect(()=>{loadList();},[]);
   const fmtTs=ts=>{try{return new Date(ts).toLocaleString("th-TH",{dateStyle:"short",timeStyle:"short"});}catch{return ts;}};
   const handleRestore=async(dataKey,label,rowIndex)=>{
@@ -844,16 +874,26 @@ function BackupTab({users,logs,mk,mw,saveU,saveLG,saveMK,saveMW,notify}){
       <Btn sm onClick={loadList} disabled={loading}>{loading?"กำลังโหลด...":"🔄 Refresh"}</Btn>
     </div>
     <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:10,marginBottom:18}}>
-      {KEYS.map(({key,label,current})=>(
+      {KEYS.map(({key,label,current,count})=>(
         <div key={key} style={{...s.card,padding:"12px 14px"}}>
           <div style={{fontSize:11,color:"#64748b",marginBottom:2}}>{label}</div>
-          <div style={{fontSize:20,fontWeight:800,color:BL}}>{Array.isArray(current)?current.length:"-"}</div>
+          <div style={{fontSize:20,fontWeight:800,color:BL}}>{count!==undefined?count:(Array.isArray(current)?current.length:"-")}</div>
           <div style={{fontSize:10,color:"#94a3b8"}}>รายการปัจจุบัน</div>
         </div>
       ))}
     </div>
     {loading&&<div style={{textAlign:"center",padding:32,color:"#94a3b8"}}>กำลังโหลด backup list จาก Google Sheet...</div>}
-    {!loading&&backupList!==null&&backupList.length===0&&(
+    {/* ⚡ v4.0 — แยก "โหลดไม่สำเร็จ" ออกจาก "ไม่มีข้อมูล" */}
+    {!loading&&listError&&(
+      <div style={{...s.card,textAlign:"center",padding:32,background:"#fef2f2",border:"1px solid #fca5a5"}}>
+        <div style={{fontSize:32,marginBottom:8}}>⚠️</div>
+        <div style={{color:"#dc2626",fontWeight:600}}>โหลด backup list ไม่สำเร็จ</div>
+        <div style={{fontSize:12,marginTop:4,color:"#991b1b"}}>{listError}</div>
+        <div style={{fontSize:12,marginTop:8,color:"#64748b"}}>ข้อมูล backup ยังอยู่ครบใน Google Sheet — กด Refresh อีกครั้งได้ค่ะ</div>
+        <div style={{marginTop:12}}><Btn sm c="pri" onClick={loadList}>ลองใหม่</Btn></div>
+      </div>
+    )}
+    {!loading&&!listError&&backupList!==null&&backupList.length===0&&(
       <div style={{...s.card,textAlign:"center",padding:32,color:"#94a3b8"}}>
         <div style={{fontSize:32,marginBottom:8}}>📭</div>
         <div>ยังไม่มี backup ใน Google Sheet</div>
