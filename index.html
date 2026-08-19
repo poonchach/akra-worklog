@@ -20,14 +20,50 @@ const {useState,useEffect,useRef,useCallback}=React;
 
 const GAS_URL="https://script.google.com/macros/s/AKfycbyWWiJlQFQsT_7PY4njK5vkpzG0YT_pHqN1_mIAQ8-o3vTLREMmErDgGb4zg0kouxpJ/exec";
 
+// ✅ SAFETY: แยก "ไม่มีข้อมูล" ออกจาก "โหลดไม่สำเร็จ"
+//    เดิมคืน null ทั้งสองกรณี → timeout แล้วระบบเขียนค่าว่างทับ
+//    ใหม่คืน {ok:true,value} / {ok:false,error}
+const FETCH_TIMEOUT=45000;   // 45 วิ ต่อครั้ง
+async function fetchT(url,opt={}){
+  const ctrl=new AbortController();
+  const t=setTimeout(()=>ctrl.abort(),FETCH_TIMEOUT);
+  try{return await fetch(url,{...opt,signal:ctrl.signal});}
+  finally{clearTimeout(t);}
+}
 const db={
   get:async(key)=>{
-    try{const r=await fetch(`${GAS_URL}?key=${encodeURIComponent(key)}`);const j=await r.json();return j.ok?j.value:null;}
-    catch(e){console.error("db.get error:",e);return null;}
+    for(let a=1;a<=3;a++){
+      try{
+        const r=await fetchT(`${GAS_URL}?key=${encodeURIComponent(key)}`);
+        if(!r.ok)throw new Error("HTTP "+r.status);
+        const txt=await r.text();
+        if(txt.trim().startsWith("<"))throw new Error("ได้ HTML แทน JSON");
+        const j=JSON.parse(txt);
+        if(!j.ok)throw new Error(j.error||"GAS error");
+        return {ok:true,value:j.value};
+      }catch(e){
+        console.warn(`db.get(${key}) ครั้งที่ ${a}:`,e.message);
+        if(a===3)return {ok:false,error:e.name==="AbortError"?"หมดเวลารอ (timeout)":e.message};
+        await new Promise(s=>setTimeout(s,1000*a));
+      }
+    }
   },
   set:async(key,value)=>{
-    try{await fetch(GAS_URL,{method:"POST",body:JSON.stringify({key,value})});}
-    catch(e){console.error("db.set error:",e);}
+    for(let a=1;a<=3;a++){
+      try{
+        const r=await fetchT(GAS_URL,{method:"POST",body:JSON.stringify({key,value})});
+        if(!r.ok)throw new Error("HTTP "+r.status);
+        const txt=await r.text();
+        if(txt.trim().startsWith("<"))throw new Error("ได้ HTML แทน JSON");
+        const j=JSON.parse(txt);
+        if(!j.ok)throw new Error(j.error||"GAS error");
+        return {ok:true};
+      }catch(e){
+        console.warn(`db.set(${key}) ครั้งที่ ${a}:`,e.message);
+        if(a===3)return {ok:false,error:e.name==="AbortError"?"หมดเวลารอ (timeout)":e.message};
+        await new Promise(s=>setTimeout(s,1000*a));
+      }
+    }
   },
   getBackupList:async()=>{
     try{const r=await fetch(`${GAS_URL}?key=__backup_list__`);const j=await r.json();return j.ok?j.value:[];}
@@ -167,21 +203,37 @@ function App(){
   useEffect(()=>{(async()=>{
     try{
       setLoadMsg("โหลดข้อมูลผู้ใช้...");
-      const u=await db.get("akra_users");
-      setLoadMsg("โหลด log...");
-      const lg=await db.get("akra_logs");
+      const ru=await db.get("akra_users");
+      setLoadMsg("โหลด log... (อาจใช้เวลาสักครู่)");
+      const rlg=await db.get("akra_logs");
       setLoadMsg("โหลด master data...");
-      const k=await db.get("akra_master_klang");
-      const w=await db.get("akra_master_wicha");
-      const initU=u||INIT_USERS;
-      const initLG=lg||[];
-      const initK=k||INIT_KLANG;
-      const initW=w||INIT_WICHA;
-      // Save เฉพาะตอนที่ GAS ยังไม่มีข้อมูลเลย (null) เท่านั้น ❌ ห้าม save ทับข้อมูลเดิม
-      if(u===null){await db.set("akra_users",initU);}
-      if(lg===null){await db.set("akra_logs",initLG);}
-      if(k===null){await db.set("akra_master_klang",initK);}
-      if(w===null){await db.set("akra_master_wicha",initW);}
+      const rk=await db.get("akra_master_klang");
+      const rw=await db.get("akra_master_wicha");
+
+      // ✅ SAFETY: ถ้าโหลดล้มเหลว → หยุดทันที ห้ามเขียนอะไรทับ
+      const failed=[];
+      if(!ru.ok) failed.push("ผู้ใช้ ("+ru.error+")");
+      if(!rlg.ok)failed.push("log ("+rlg.error+")");
+      if(!rk.ok) failed.push("พิธีกลาง ("+rk.error+")");
+      if(!rw.ok) failed.push("สายวิชา ("+rw.error+")");
+      if(failed.length){
+        setInitError("โหลดข้อมูลไม่สำเร็จ: "+failed.join(", ")+
+          " — ระบบหยุดทำงานเพื่อป้องกันข้อมูลถูกเขียนทับ กรุณา refresh หน้าใหม่");
+        setL(true);
+        return;
+      }
+
+      const initU =ru.value  ||INIT_USERS;
+      const initLG=rlg.value ||[];
+      const initK =rk.value  ||INIT_KLANG;
+      const initW =rw.value  ||INIT_WICHA;
+
+      // เขียนค่าเริ่มต้นเฉพาะเมื่อยืนยันแล้วว่ายังไม่เคยมีข้อมูล (value===null)
+      if(ru.value===null) {await db.set("akra_users",initU);}
+      if(rlg.value===null){await db.set("akra_logs",initLG);}
+      if(rk.value===null) {await db.set("akra_master_klang",initK);}
+      if(rw.value===null) {await db.set("akra_master_wicha",initW);}
+
       setU(initU);setLG(initLG);setMK(initK);setMW(initW);
       setL(true);
     }catch(e){
@@ -191,21 +243,44 @@ function App(){
     }
   })();},[]);
 
-  const saveU=useCallback(async v=>{setU(v);showSync("syncing");try{await db.set("akra_users",v);showSync("ok");}catch{showSync("error");}}, []);
-  const saveLG=useCallback(async v=>{setLG(v);showSync("syncing");try{await db.set("akra_logs",v);showSync("ok");}catch{showSync("error");}}, []);
-  const saveMK=useCallback(async v=>{setMK(v);showSync("syncing");try{await db.set("akra_master_klang",v);showSync("ok");}catch{showSync("error");}}, []);
-  const saveMW=useCallback(async v=>{setMW(v);showSync("syncing");try{await db.set("akra_master_wicha",v);showSync("ok");}catch{showSync("error");}}, []);
+  // ✅ SAFETY: guard กันบันทึกทับด้วยข้อมูลที่ลดผิดปกติ + rollback เมื่อล้มเหลว
+  const lgRef=useRef([]), uRef=useRef([]);
+  useEffect(()=>{lgRef.current=logs;},[logs]);
+  useEffect(()=>{uRef.current=users;},[users]);
+
+  const saveWithGuard=async(key,label,prev,next,setter)=>{
+    const p=Array.isArray(prev)?prev.length:0, n=Array.isArray(next)?next.length:0;
+    if(p>0&&(n===0||n<p*0.5)){
+      const msg=n===0?`กำลังจะลบ${label}ทั้งหมด ${p} รายการ`
+                     :`${label}จะลดจาก ${p} เหลือ ${n} รายการ (ลดเกิน 50%)`;
+      if(!window.confirm("⚠️ ตรวจพบการเปลี่ยนแปลงผิดปกติ\n\n"+msg+
+        "\n\nหากไม่ได้ตั้งใจ ให้กดยกเลิกแล้ว refresh หน้าใหม่\n\nยืนยันบันทึกหรือไม่?")){
+        showSync("error");return false;
+      }
+    }
+    setter(next);showSync("syncing");
+    const r=await db.set(key,next);
+    if(r.ok){showSync("ok");return true;}
+    setter(prev);showSync("error");
+    window.alert("บันทึกไม่สำเร็จ: "+r.error+"\nระบบคืนค่าเดิมแล้ว กรุณาลองใหม่");
+    return false;
+  };
+
+  const saveU =useCallback(async v=>saveWithGuard("akra_users","ผู้ใช้",uRef.current,v,setU),[]);
+  const saveLG=useCallback(async v=>saveWithGuard("akra_logs","log",lgRef.current,v,setLG),[]);
+  const saveMK=useCallback(async v=>{setMK(v);showSync("syncing");const r=await db.set("akra_master_klang",v);showSync(r.ok?"ok":"error");},[]);
+  const saveMW=useCallback(async v=>{setMW(v);showSync("syncing");const r=await db.set("akra_master_wicha",v);showSync(r.ok?"ok":"error");},[]);
 
   useEffect(()=>{
     if(!loaded||initError)return;
     const iv=setInterval(async()=>{
       try{
-        const[u,lg,k,w]=await Promise.all([db.get("akra_users"),db.get("akra_logs"),db.get("akra_master_klang"),db.get("akra_master_wicha")]);
-        // อัปเดตเฉพาะถ้าข้อมูลที่ได้มาไม่ว่าง และ logs ไม่น้อยกว่าที่มีอยู่
-        if(u&&Array.isArray(u)&&u.length>0)setU(u);
-        if(lg&&Array.isArray(lg)&&lg.length>0)setLG(prev=>lg.length>=prev.length?lg:prev);
-        if(k&&Array.isArray(k)&&k.length>0)setMK(k);
-        if(w&&Array.isArray(w)&&w.length>0)setMW(w);
+        const[ru,rlg,rk,rw]=await Promise.all([db.get("akra_users"),db.get("akra_logs"),db.get("akra_master_klang"),db.get("akra_master_wicha")]);
+        // ✅ SAFETY: อัปเดตเฉพาะเมื่อโหลดสำเร็จและข้อมูลไม่ว่าง
+        if(ru.ok &&Array.isArray(ru.value) &&ru.value.length>0)setU(ru.value);
+        if(rlg.ok&&Array.isArray(rlg.value)&&rlg.value.length>0)setLG(prev=>rlg.value.length>=prev.length?rlg.value:prev);
+        if(rk.ok &&Array.isArray(rk.value) &&rk.value.length>0)setMK(rk.value);
+        if(rw.ok &&Array.isArray(rw.value) &&rw.value.length>0)setMW(rw.value);
       }catch(e){console.warn("Auto-refresh failed:",e);}
     },30000);
     return()=>clearInterval(iv);
@@ -520,13 +595,8 @@ function BackupTab({users,logs,mk,mw,saveU,saveLG,saveMK,saveMW,notify}){
     setRestoring(null);await loadList();
   };
   const grouped={};
-  // sort ก่อน group — แปลง timestamp เป็น number เพื่อรองรับทั้ง string และ Date object
-  const sortedList=[...(backupList||[])].sort((a,b)=>{
-    const ta=new Date(a.timestamp).getTime();
-    const tb=new Date(b.timestamp).getTime();
-    return tb-ta; // desc: ใหม่สุดก่อน
-  });
-  sortedList.forEach(r=>{if(!grouped[r.key])grouped[r.key]=[];grouped[r.key].push(r);});
+  (backupList||[]).forEach(r=>{if(!grouped[r.key])grouped[r.key]=[];grouped[r.key].push(r);});
+  Object.keys(grouped).forEach(k=>{grouped[k].reverse();});
   const[expandedRow,setExpandedRow]=useState(null);
   const th={background:"#f8fafc",padding:"8px 12px",textAlign:"left",fontWeight:700,fontSize:11,color:"#64748b",borderBottom:"1px solid #e2e8f0"};
   const td={padding:"8px 12px",borderBottom:"1px solid #f1f5f9",fontSize:12,verticalAlign:"middle"};
