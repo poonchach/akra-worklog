@@ -234,7 +234,7 @@ function AlertDlg({title,body,onClose,kind="ok"}){
 }
 function ModalWrap({title,onClose,children}){return <div onClick={e=>e.target===e.currentTarget&&onClose()} style={{position:"fixed",inset:0,background:"rgba(0,0,0,.4)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200,padding:16}}><div style={{background:"#fff",borderRadius:14,width:"100%",maxWidth:560,maxHeight:"90vh",overflow:"auto",boxShadow:"0 20px 60px rgba(0,0,0,.2)"}}><div style={{padding:"14px 20px",borderBottom:"1px solid #e2e8f0",display:"flex",justifyContent:"space-between",alignItems:"center",position:"sticky",top:0,background:"#fff"}}><span style={{fontWeight:700,fontSize:15}}>{title}</span><button onClick={onClose} style={{background:"none",border:"none",cursor:"pointer",fontSize:20,color:"#94a3b8",lineHeight:1}}>×</button></div><div style={{padding:20}}>{children}</div></div></div>;}
 
-function LogForm({init,onSave,onCancel,cu,users,masterKlang,masterWicha,existingLogs}){
+function LogForm({init,onSave,onCancel,cu,users,masterKlang,masterWicha,existingLogs,busy}){
   const blank={username:cu.username,date:tday(),timeIn:"",timeOut:"",kl:[{t:"",q:""}],wi:[{t:"",q:""}],ot:[{d:"",h:""}]};
   const[f,sf]=useState(()=>init?{...init,kl:init.phitiKlang?.length?init.phitiKlang.map(x=>({t:x.t,q:x.q})):[{t:"",q:""}],wi:init.phitiWicha?.length?init.phitiWicha.map(x=>({t:x.t,q:x.q})):[{t:"",q:""}],ot:init.others?.length?init.others.map(x=>({d:x.d,h:x.h})):[{d:"",h:""}]}:blank);
   const[dupeWarn,setDupeWarn]=useState(null);
@@ -271,7 +271,7 @@ function LogForm({init,onSave,onCancel,cu,users,masterKlang,masterWicha,existing
     <SecH>งานอื่นๆ</SecH>
     {f.ot.map((r,i)=><div key={i} style={rowStyle}><div style={numBadge}>{i+1}</div><div style={{flex:3}}><Inp placeholder="ระบุงานที่ทำ" value={r.d} onChange={e=>up("ot",i,"d",e.target.value)}/></div><div style={{flex:1}}><Inp type="number" min="0" placeholder="ชม." value={r.h} onChange={e=>up("ot",i,"h",e.target.value)}/></div>{f.ot.length>1&&<button onClick={()=>rm("ot",i)} style={{background:"none",border:"none",cursor:"pointer",color:"#94a3b8",fontSize:16,flexShrink:0}}>×</button>}</div>)}
     {addBtn("ot","เพิ่มงานอื่นๆ")}
-    <div style={{display:"flex",justifyContent:"flex-end",gap:8,paddingTop:12,borderTop:"1px solid #e2e8f0"}}>{onCancel&&<Btn onClick={onCancel}>ยกเลิก</Btn>}<Btn c="pri" onClick={submit}>บันทึก</Btn></div>
+    <div style={{display:"flex",justifyContent:"flex-end",gap:8,paddingTop:12,borderTop:"1px solid #e2e8f0"}}>{onCancel&&<Btn onClick={onCancel}>ยกเลิก</Btn>}<Btn c="pri" disabled={busy} onClick={submit}>{busy?"กำลังบันทึก...":"บันทึก"}</Btn></div>
   </>;
 }
 
@@ -525,18 +525,27 @@ function LoginPage({users,setCu,setTab,notify,saveU,syncStatus}){
 
 function EntryTab({cu,users,mk,mw,logs,notify,upsertLogs,loadMonths,loadedMonths}){
   const[alertDlg,setAlertDlg]=useState(null);const[formKey,setFormKey]=useState(0);
+  // 🛡️ v4.2 — กันกดบันทึกซ้ำระหว่างรอ + ใช้ค่า logs ล่าสุดเสมอ
+  const[saving,setSaving]=useState(false);
+  const logsRef=useRef(logs);
+  useEffect(()=>{logsRef.current=logs;},[logs]);
+
   const save=async f=>{
-    // 🆕 ถ้ากรอกวันที่ของเดือนที่ยังไม่ได้โหลด ต้องโหลดก่อนเพื่อตรวจซ้ำให้ถูก
-    const ym=ymOf(f.date);
-    if(loadedMonths.indexOf(ym)<0){
-      const ok=await loadMonths([ym]);
+    if(saving)return;            // กันกดซ้ำ
+    setSaving(true);
+    try{
+      // ถ้ากรอกวันที่ของเดือนที่ยังไม่ได้โหลด ต้องโหลดก่อนเพื่อตรวจซ้ำให้ถูก
+      const ym=ymOf(f.date);
+      if(loadedMonths.indexOf(ym)<0){
+        const ok=await loadMonths([ym]);
+        if(!ok)return;
+      }
+      // ใช้ logsRef เพื่อให้ได้ค่าล่าสุด (props อาจยังไม่อัปเดตหลัง loadMonths)
+      const existing=logsRef.current.find(l=>l.username===f.username&&l.date===f.date);
+      const rec=existing?{...existing,...f}
+                        :{id:uid(),...f,createdAt:new Date().toISOString()};
+      const ok=await upsertLogs([rec]);
       if(!ok)return;
-    }
-    const existing=logs.find(l=>l.username===f.username&&l.date===f.date);
-    const rec=existing?{...existing,...f}
-                      :{id:uid(),...f,createdAt:new Date().toISOString()};
-    const ok=await upsertLogs([rec]);
-    if(!ok)return;
     setAlertDlg({title:"บันทึกข้อมูลเรียบร้อย",body:<div>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:4}}>
         <div style={{background:"#f8fafc",borderRadius:8,padding:"10px 14px"}}><div style={{fontSize:11,color:"#64748b",marginBottom:2}}>ผู้ทำงาน</div><div style={{fontWeight:600,fontSize:13}}>{users.find(u=>u.username===f.username)?.displayName||f.username}</div></div>
@@ -547,13 +556,14 @@ function EntryTab({cu,users,mk,mw,logs,notify,upsertLogs,loadMonths,loadedMonths
         <div style={{fontSize:12,color:"#374151",lineHeight:1.8}}>พิธีกลาง: <b>{f.phitiKlang.length}</b> | สายวิชา: <b>{f.phitiWicha.length}</b> | งานอื่นๆ: <b>{f.others.length}</b>{existing&&<div style={{marginTop:4,color:"#0f766e",fontWeight:600}}>✓ อัปเดตข้อมูลของวันนี้แล้ว</div>}</div>
       </div>
     </div>});
-    setFormKey(k=>k+1);
+      setFormKey(k=>k+1);
+    }finally{ setSaving(false); }
   };
   return(
     <div style={{maxWidth:720}}>
       {alertDlg&&<AlertDlg title={alertDlg.title} body={alertDlg.body} kind="ok" onClose={()=>setAlertDlg(null)}/>}
       <h2 style={{fontSize:19,fontWeight:700,marginBottom:18}}>บันทึกการทำงาน</h2>
-      <div style={s.card}><LogForm key={formKey} cu={cu} users={users} masterKlang={mk} masterWicha={mw} onSave={save} existingLogs={logs}/></div>
+      <div style={s.card}><LogForm key={formKey} cu={cu} users={users} masterKlang={mk} masterWicha={mw} onSave={save} existingLogs={logs} busy={saving}/></div>
     </div>
   );
 }
